@@ -25,6 +25,10 @@ emptyState = do
   (MutableLevel leaf) <- makeMutableLeaf
   return $ TransientVectorState 0 bitsPerLevel (EditedBranch root) leaf True 0
 
+tailOffset :: TransientVectorState s a -> Int
+tailOffset v = if tvCount v < levelSize
+  then 0
+  else shiftL (shiftR (tvCount v - 1) bitsPerLevel) bitsPerLevel
 
 empty :: PrimMonad m => m (TransientVector (PrimState m) a)
 empty = do
@@ -46,11 +50,13 @@ newPath level node = case level of
   l -> do
     arr <- newSmallArray levelSize EmptyTransientNode
     writeSmallArray arr 0 =<< newPath (descendLevel l) node
-    return . EditedBranch . MutableLevel $ arr
+    return . EditedBranch $ MutableLevel arr
 
+pushTail :: PrimMonad m => TransientVectorState (PrimState m) a -> m (TransientNode (PrimState m) a)
+pushTail v = pushTail' (tvCount v) (tvShift v) (tvRoot v) (tvTail v)
 
 pushTail' :: PrimMonad m
-          => Int -- ^ vCount v
+          => Int -- ^ tvCount v
           -> Int -- ^ level
           -> TransientNode (PrimState m) a
           -> SmallMutableArray (PrimState m) a
@@ -124,35 +130,37 @@ write = undefined
 push :: PrimMonad m => TransientVector (PrimState m) a -> a -> m ()
 push v x = do
   s <- getState v
+  -- check root overflow
+  let c' = tvCount s + 1
+      tc = tvTailCount s
+      tc' = tc + 1
   if (tvCount s - tailOffset s) < levelSize
   -- if there's room in tail, just return with a copied array and a new value tacked on
-  then s { tvCount = c'
-         , tvTailCount = tc'
-         , tvTail = runST $ do
-             arr <- newSmallArray tc' x
-             copySmallArray (vTail v) 0 arr 0 tc
-             unsafeFreezeSmallArray arr
-         }
-  else let !(newRoot, newShift) = if branchesWillOverflow v
-              then runST $ do
-                arr <- newSmallArray levelSize EmptyNode
-                writeSmallArray arr 0 (vRoot v)
-                writeSmallArray arr 1 (newPath (vShift v) (Leaf . Level $ vTail v))
-                farr <- unsafeFreezeSmallArray arr
-                return (Branch . Level $ farr, ascendLevel $ vShift v) 
-              else (pushTail v, vShift v)
-           !tail = runST (unsafeFreezeSmallArray =<< newSmallArray 1 x)
-      -- check root overflow
-       in v { vCount = c'
-            , vShift = newShift
-            , vRoot = newRoot
-            , vTail = tail
-            , vTailCount = 1
-            }
-  where
-    c' = vCount v + 1
-    tc = vTailCount v
-    tc' = tc + 1
+  then do
+    tvTail' <- newSmallArray tc' x
+    copySmallMutableArray (tvTail s) 0 tvTail' 0 tc
+    putState v $ s { tvCount = c'
+                   , tvTailCount = tc'
+                   , tvTail = tvTail'
+                   }
+  else do
+    !(newRoot, newShift) <- if branchesWillOverflow s
+      then do
+        arr <- newSmallArray levelSize EmptyTransientNode
+        writeSmallArray arr 0 (tvRoot s)
+        path <- newPath (tvShift s) (EditedLeaf . MutableLevel $ tvTail s)
+        writeSmallArray arr 1 path
+        return (EditedBranch . MutableLevel $ arr, ascendLevel $ tvShift s)
+      else do
+        newTail <- pushTail s
+        return (newTail, tvShift s)
+    !tail <- newSmallArray 1 x
+    putState v $ s { tvCount = c'
+                   , tvShift = newShift
+                   , tvRoot = newRoot
+                   , tvTail = tail
+                   , tvTailCount = 1
+                   }
 
 pop :: PrimMonad m => TransientVector (PrimState m) a -> m (Maybe a)
 pop = undefined
