@@ -144,7 +144,7 @@ makePersistentNode n = case n of
       writeMutVar counter (i + 1)
     (Branch . Level) <$> unsafeFreezeSmallArray arr'
   EmptyTransientNode -> return EmptyNode
- 
+
 makeTransientNode :: Node a -> TransientNode s a
 makeTransientNode n = case n of
   Leaf arr -> UneditedLeaf arr

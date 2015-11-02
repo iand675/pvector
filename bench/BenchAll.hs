@@ -1,8 +1,20 @@
 module Main where
 
 import Criterion
+import Criterion.Main
+import Data.List
+import GHC.Exts
+import qualified Data.Vector as V
+import qualified Data.Vector.Persistent as P
 
-main = defaultMain [
+testEnv :: Int -> IO ([Int], V.Vector Int, P.Vector Int)
+testEnv pow = do
+  let ns = [1 .. 32 ^ pow]
+  return (ns, fromList ns, fromList ns)
+
+main = defaultMain
+  [
+{-
   bgroup "Alternative" []
   bgroup "Monad" []
   bgroup "Functor" []
@@ -11,22 +23,80 @@ main = defaultMain [
   bgroup "Foldable" []
   bgroup "Traversable" []
   bgroup "IsList" []
-  bgroup "Eq" []
+-}
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "Eq" [
+      bench "[Int] (==)" $ whnf (== l) l,
+      bench "Vector Int (==)" $ whnf (== v) v,
+      bench "PersistentVector Int (==)" $ whnf (== pv) pv
+    ]
+  ,
+{-
   bgroup "Data" []
   bgroup "Ord" []
   bgroup "Read" []
   bgroup "Show" []
   bgroup "Monoid" []
   bgroup "NFData" []
-  bgroup "length" []
-  bgroup "null" []
-  bgroup "(!)" []
+-}
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "length" [
+      bench "[Int] length" $ whnf length l,
+      bench "Vector Int length" $ whnf length v,
+      bench "PersistentVector Int length" $ whnf length pv
+    ]
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "null" [
+      bench "[Int] null" $ whnf null l,
+      bench "Vector Int null" $ whnf null v,
+      bench "PersistentVector Int null" $ whnf null pv
+    ]
+  ,
+    let end = pred (32 ^ 3) in
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "index" [
+      bench "[]" $ nf (!! end) l,
+      bench "Vector" $ nf (V.! end) v,
+      bench "PersistentVector" $ nf (end P.!) pv
+    ]
+  ,
+    let end = pred (32 ^ 3) in
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "unsafeIndex" [
+      bench "Vector" $ nf (`V.unsafeIndex` end) v,
+      bench "PersistentVector" $ nf (`P.unsafeIndex` end) pv
+    ]
+{-
   bgroup "(!?)" []
-  bgroup "head" []
-  bgroup "last" []
-  bgroup "unsafeIndex" []
-  bgroup "unsafeHead" []
-  bgroup "unsafeLast" []
+-}
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "head" [
+      bench "[]" $ whnf head l,
+      bench "Vector" $ whnf V.head v,
+      bench "PersistentVector" $ whnf P.head pv
+    ]
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "unsafeHead" [
+      bench "Vector" $ whnf V.unsafeHead v,
+      bench "PersistentVector" $ whnf P.unsafeHead pv
+    ]
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "last" [
+      bench "[]" $ whnf last l,
+      bench "Vector" $ whnf V.last v,
+      bench "PersistentVector" $ whnf P.last pv
+    ]
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "unsafeLast" [
+      bench "Vector" $ whnf V.unsafeLast v,
+      bench "PersistentVector" $ whnf P.unsafeLast pv
+    ]
+{-
   bgroup "indexM" []
   bgroup "headM" []
   bgroup "lastM" []
@@ -44,8 +114,22 @@ main = defaultMain [
   bgroup "unsafeTail" []
   bgroup "unsafeTake" []
   bgroup "unsafeDrop" []
-  bgroup "empty" []
-  bgroup "singleton" []
+-}
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "empty" [
+      bench "[]" $ whnf (const []) (),
+      bench "Vector" $ whnf (const V.empty) (),
+      bench "PersistentVector" $ whnf (const P.empty) ()
+    ]
+  ,
+    env (testEnv 3) $ \ ~(l, v, pv) ->
+    bgroup "singleton" [
+      bench "[]" $ whnf (:[]) (),
+      bench "Vector" $ whnf V.singleton (),
+      bench "PersistentVector" $ whnf P.singleton ()
+    ]
+{-
   bgroup "replicate" []
   bgroup "generate" []
   bgroup "iterateN" []
@@ -61,7 +145,15 @@ main = defaultMain [
   bgroup "enumFromTo" []
   bgroup "enumFromThenTo" []
   bgroup "cons" []
-  bgroup "snoc" []
+-}
+  ,
+    let end = pred (32 ^ 3) in
+    bgroup "snoc" [
+      bench "[]" $ nf (foldr (\x l -> l ++ [x]) []) ([1..end] :: [Int]),
+      bench "Vector" $ nf (foldr (\x l -> V.snoc l x) V.empty) ([1..end] :: [Int]),
+      bench "PersistentVector" $ nf (foldr (\x l -> P.snoc l x) P.empty) ([1..end] :: [Int])
+    ]
+{-
   bgroup "(++)" []
   bgroup "concat" []
   bgroup "force" []
@@ -187,6 +279,7 @@ main = defaultMain [
   bgroup "fromList" []
   bgroup "fromListN" []
   bgroup "transient" []
+  -}
   {-
    -- transient
    bgroup "length" []
@@ -225,8 +318,4 @@ main = defaultMain [
    bgroup "unsafeCopy"
    bgroup "unsafeMove"
    -}
-   {-
-    -- rewrite rules
-    -}
-]
-
+  ]

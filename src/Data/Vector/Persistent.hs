@@ -16,8 +16,17 @@ module Data.Vector.Persistent (
   I.concat,
   I.concatMap,
   I.map,
+  I.head,
+  I.unsafeHead,
+  I.last,
+  I.unsafeLast,
   I.transient,
-  I.persist
+  I.persist,
+  M.presized,
+  M.write,
+  M.push,
+  M.pop
 ) where
 import qualified Data.Vector.Internal.Persistent as I
+import qualified Data.Vector.Internal.Transient as M
 

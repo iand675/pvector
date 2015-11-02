@@ -34,7 +34,11 @@ benchmark bench-pvectors-all
   build-depends:    base,
                     deepseq,
                     ghc-prim,
-                    criterion
+                    criterion,
+                    vector,
+                    primitive,
+                    mtl
+
   ghc-options:      -O2
                     -fmax-simplifier-iterations=10
                     -fdicts-cheap

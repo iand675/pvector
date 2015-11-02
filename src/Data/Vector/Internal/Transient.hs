@@ -10,6 +10,8 @@ import Debug.Trace
 newtype TransientVector s a
   = TransientVector { tvState :: (MutVar s (TransientVectorState s a)) }
 
+type TransientIOVector = TransientVector RealWorld
+
 data TransientVectorState s a = TransientVectorState
   { tvCount      :: {-# UNPACK #-} !Int
   , tvShift      :: {-# UNPACK #-} !Int
@@ -135,32 +137,32 @@ push v x = do
       tc = tvTailCount s
       tc' = tc + 1
   if (tvCount s - tailOffset s) < levelSize
-  -- if there's room in tail, just return with a copied array and a new value tacked on
-  then do
-    tvTail' <- newSmallArray tc' x
-    copySmallMutableArray (tvTail s) 0 tvTail' 0 tc
-    putState v $ s { tvCount = c'
-                   , tvTailCount = tc'
-                   , tvTail = tvTail'
-                   }
-  else do
-    !(newRoot, newShift) <- if branchesWillOverflow s
-      then do
-        arr <- newSmallArray levelSize EmptyTransientNode
-        writeSmallArray arr 0 (tvRoot s)
-        path <- newPath (tvShift s) (EditedLeaf . MutableLevel $ tvTail s)
-        writeSmallArray arr 1 path
-        return (EditedBranch . MutableLevel $ arr, ascendLevel $ tvShift s)
-      else do
-        newTail <- pushTail s
-        return (newTail, tvShift s)
-    !tail <- newSmallArray 1 x
-    putState v $ s { tvCount = c'
-                   , tvShift = newShift
-                   , tvRoot = newRoot
-                   , tvTail = tail
-                   , tvTailCount = 1
-                   }
+    -- if there's room in tail, just return with a copied array and a new value tacked on
+    then do
+      tvTail' <- newSmallArray tc' x
+      copySmallMutableArray (tvTail s) 0 tvTail' 0 tc
+      putState v $ s { tvCount = c'
+                     , tvTailCount = tc'
+                     , tvTail = tvTail'
+                     }
+    else do
+      !(newRoot, newShift) <- if branchesWillOverflow s
+        then do
+          arr <- newSmallArray levelSize EmptyTransientNode
+          writeSmallArray arr 0 (tvRoot s)
+          path <- newPath (tvShift s) (EditedLeaf . MutableLevel $ tvTail s)
+          writeSmallArray arr 1 path
+          return (EditedBranch . MutableLevel $ arr, ascendLevel $ tvShift s)
+        else do
+          newTail <- pushTail s
+          return (newTail, tvShift s)
+      !tail <- newSmallArray 1 x
+      putState v $ s { tvCount = c'
+                     , tvShift = newShift
+                     , tvRoot = newRoot
+                     , tvTail = tail
+                     , tvTailCount = 1
+                     }
 
 pop :: PrimMonad m => TransientVector (PrimState m) a -> m (Maybe a)
 pop = undefined

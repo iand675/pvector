@@ -80,10 +80,10 @@ update1 :: Int -> a -> Vector a -> Vector a
 update1 i x v = if i >= 0 && i < vCount v
   then if i >= tailOffset v
     then runST $ do
-      let c = vTailCount v 
+      let c = vTailCount v
           ml = maskLevel i
       arr <- unsafeThawSmallArray (cloneSmallArray (vTail v) 0 c)
-      writeSmallArray arr ml x 
+      writeSmallArray arr ml x
       arr' <- unsafeFreezeSmallArray arr
       return $ v { vTail = arr' }
     else v { vRoot = go (vShift v) (vRoot v) }
@@ -92,7 +92,7 @@ update1 i x v = if i >= 0 && i < vCount v
     -- go :: Int -> Node a -> Node a
     go 0 (Leaf (Level arr)) = runST $ do
       let ml = maskLevel i
-          ls = levelSize 
+          ls = levelSize
       arr' <- unsafeThawSmallArray (cloneSmallArray arr 0 ls)
       writeSmallArray arr' ml x
       (Leaf . Level) <$> unsafeFreezeSmallArray arr'
@@ -181,7 +181,7 @@ snoc v x = if (vCount v - tailOffset v) < levelSize
                 writeSmallArray arr 0 (vRoot v)
                 writeSmallArray arr 1 (newPath (vShift v) (Leaf . Level $ vTail v))
                 farr <- unsafeFreezeSmallArray arr
-                return (Branch . Level $ farr, ascendLevel $ vShift v) 
+                return (Branch . Level $ farr, ascendLevel $ vShift v)
               else (pushTail v, vShift v)
            !tail = runST (unsafeFreezeSmallArray =<< newSmallArray 1 x)
       -- check root overflow
@@ -258,7 +258,7 @@ popTail v@(Vector{..}) level node = case node of
       -- a value there, then remove the current node
       (0, Nothing) -> Nothing
       (_, Just newChild) -> runST $ do
-        arr' <- unsafeThawSmallArray arr 
+        arr' <- unsafeThawSmallArray arr
         cloned <- cloneSmallMutableArray arr' 0 ls
         writeSmallArray cloned subIndex newChild
         (Just . Branch . Level) <$> unsafeFreezeSmallArray cloned
@@ -275,7 +275,7 @@ popTail v@(Vector{..}) level node = case node of
     subIndex = maskLevel $ shiftR (vCount - 2) level
     ls = levelSize
 
--- TODO bench with cursor
+-- TODO copy & push tail rather than write one at a time
 concat :: Foldable f => f (Vector a) -> Vector a
 concat vs = runST $ do
   mv <- T.presized totalSize
@@ -351,7 +351,7 @@ instance Foldable Vector where
       foldlArray !i x a = if i >= 0
         then foldlArray (pred i) (f x (indexSmallArray a i)) a
         else x
-      foldedTail = foldlArray (pred tc) x t 
+      foldedTail = foldlArray (pred tc) x t
       vSegments = [0, levelSize .. tailOffset v - levelSize]
       vArrays = Prelude.map (unsafeLevelFor v) vSegments
 
@@ -361,7 +361,7 @@ instance Foldable Vector where
       foldlArray !i x a = if i >= 0
         then let !res = f x $ indexSmallArray a i
              in foldlArray (pred i) res a
-        else x 
+        else x
       foldedTail = foldlArray (pred tc) x t
       vSegments = [0, levelSize .. tailOffset v - levelSize]
       vArrays = Prelude.map (unsafeLevelFor v) vSegments
@@ -392,7 +392,7 @@ instance Eq a => Eq (Vector a) where
     then False
     else foldedTail && all (foldlArray levelBound) vArrays
     where
-      foldlArray !i as@(la, ra) = if i >= 0 
+      foldlArray !i as@(la, ra) = if i >= 0
         then if indexSmallArray la i == indexSmallArray ra i
                then foldlArray (pred i) as
                else False
@@ -400,16 +400,19 @@ instance Eq a => Eq (Vector a) where
       foldedTail = foldlArray (pred tc1) (t1, t2)
       vSegments = [0, levelSize .. tailOffset v1 - levelSize]
       vArrays = Prelude.map (\i -> (unsafeLevelFor v1 i, unsafeLevelFor v2 i)) vSegments
-  
+
 {-
 instance Ord a => Ord (Vector a) where
 instance Read a => Read (Vector a) where
+-}
 
 instance NFData a => NFData (Vector a) where
-  rnf _ = undefined
--}
- 
- 
+  rnf v = force 0
+    where
+      len = vCount v
+      force !ix | ix < len = rnf (unsafeIndex v ix) `seq` force (ix + 1)
+                | otherwise = ()
+
 transient :: PrimMonad m => Vector a -> m (TE.TransientVector (PrimState m) a)
 transient v@(Vector{..}) = do
   mTail <- unsafeThawSmallArray vTail
@@ -422,5 +425,18 @@ persist tv = do
   n <- makePersistentNode $ T.tvRoot st
   farr <- unsafeFreezeSmallArray $ T.tvTail st
   return $ Vector (T.tvCount st) (T.tvShift st) n farr (T.tvTailCount st)
- 
+
+head :: Vector a -> a
+head = (`index` 0)
+
+unsafeHead :: Vector a -> a
+unsafeHead = (`unsafeIndex` 0)
+
+last :: Vector a -> a
+last v = if vCount v > 0
+           then unsafeLast v
+           else error "Data.Vector.Persistent.last: empty vector"
+
+unsafeLast :: Vector a -> a
+unsafeLast v = unsafeIndex v (vCount v - 1)
 
