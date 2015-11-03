@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Data.Vector.Internal.Transient where
 import Control.Monad
 import Control.Monad.Primitive
@@ -103,6 +104,32 @@ lastShiftCapacity v = shiftL 1 (tvShift v)
 branchesWillOverflow :: TransientVectorState s a -> Bool
 branchesWillOverflow v = fullLeaves v > lastShiftCapacity v
 
+levelFor :: PrimMonad m => TransientVectorState (PrimState m) a -> Int -> m (SmallMutableArray (PrimState m) a)
+levelFor v i = if i >= 0 && i < tvCount v
+  then unsafeLevelFor v i
+  else error "Data.PersistentVector.nodeFor: index out of bounds"
+
+unsafeLevelFor :: forall m a. PrimMonad m => TransientVectorState (PrimState m) a -> Int -> m (SmallMutableArray (PrimState m) a)
+unsafeLevelFor v i = if i >= tailOffset v
+  then return $ tvTail v
+  else go (tvShift v) (tvRoot v)
+  where
+    go :: Int -> TransientNode (PrimState m) a -> m (SmallMutableArray (PrimState m) a)
+    go level node = let !ix = maskLevel (i `shiftR` level) in case node of
+      UneditedBranch (Level arr) -> case indexSmallArray arr ix of
+        EmptyNode -> error "Data.PersistentVector.nodeFor: invariant violation, uninitialized branch should have been initialized already"
+        br -> unsafeThawSmallArray $ go' (descendLevel level) br
+      UneditedLeaf (Level arr) -> unsafeThawSmallArray arr
+      EditedBranch (MutableLevel arr) -> readSmallArray arr ix >>= go (descendLevel level)
+      EditedLeaf (MutableLevel arr) -> return arr
+      EmptyTransientNode -> error "Data.PersistentVector.nodeFor: invariant violation, uninitialized branch should have been initialized already"
+    go' level node = let !ix = maskLevel (i `shiftR` level) in case node of
+      Branch (Level arr) -> case indexSmallArray arr ix of
+        EmptyNode -> error "Data.PersistentVector.nodeFor: invariant violation, uninitialized branch should have been initialized already"
+        br -> go' (descendLevel level) br
+      Leaf (Level arr) -> arr
+      EmptyNode -> error "Data.PersistentVector.nodeFor: invariant violation, uninitialized branch should have been initialized already"
+
 presized :: PrimMonad m => Int -> m (TransientVector (PrimState m) a)
 presized n = do
   v <- emptyState
@@ -111,7 +138,7 @@ presized n = do
   TransientVector <$> newMutVar (v' { tvCount = n, tvTail = tail, tvTailCount = rest })
   where
     (full, rest) = divMod n levelSize
-    go v c = if c > levelBound 
+    go v c = if c > levelBound
       then return v
       else do
         let currentCount = shiftL c bitsPerLevel
@@ -124,9 +151,22 @@ presized n = do
               }) (c + 1)
 
 
+index :: PrimMonad m => TransientVector (PrimState m) a -> Int -> m a
+index v i = do
+  st <- getState v
+  arr <- levelFor st i
+  readSmallArray arr (maskLevel i)
+
+
+unsafeIndex :: PrimMonad m => TransientVector (PrimState m) a -> Int -> m a
+unsafeIndex v i = do
+  st <- getState v
+  arr <- unsafeLevelFor st i
+  readSmallArray arr (maskLevel i)
+
+
 write :: PrimMonad m => TransientVector (PrimState m) a -> Int -> a -> m ()
 write = undefined
-
 
 -- TODO, alter transient vector impl to treat length and tailLength as MutVars
 push :: PrimMonad m => TransientVector (PrimState m) a -> a -> m ()
