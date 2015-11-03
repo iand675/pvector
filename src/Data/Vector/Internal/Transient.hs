@@ -164,9 +164,50 @@ unsafeIndex v i = do
   arr <- unsafeLevelFor st i
   readSmallArray arr (maskLevel i)
 
+-- copied on write or no?
+data WriteStatus = Copied | NotCopied
 
 write :: PrimMonad m => TransientVector (PrimState m) a -> Int -> a -> m ()
-write = undefined
+write v i x = do
+  return ()
+  {-
+  st <- getState v
+  st' <- if i >= 0 && i < tvCount st
+    then if i >= tailOffset st
+           then do
+              let c = tvTailCount st
+                  ml = maskLevel i
+              writeSmallArray (tvTail st) ml x
+              return $ st { tvTailEdited = True }
+           else go (tvShift v) (tvRoot v)
+    else error "Data.Vector.Transient.write: index out of bounds"
+  putState v st'
+  where
+    go 0 node = case node of
+      UneditedLeaf (Level a) -> do
+        
+        return $! Just a'
+      EditedLeaf (MutableLevel a) -> do
+        let ml = maskLevel i
+            ls = levelSize
+        writeSmallArray a ml x
+        return Nothing
+
+      EmptyTransientNode -> error "Data.Vector.Transient.update: invariant violation, node should be initialized, but isn't"
+      _ -> error "Data.Vector.Transient.update: invariant violation, at level 0 but still on a branch"
+    go n node = let ls = levelSize
+                    si = maskeLevel $ shiftR i n in case node of
+      UneditedBranch (Level a) -> do
+        copied <- copy branch
+        childUpdate <- go copied
+        case childUpdate of
+          Nothing
+          Just child
+        return $! Just copied
+      EditedBranch (MutableLevel a) -> readSmallArray arr si >>= go (descendLevel n)
+      EmptyTransientNode -> error "Data.Vector.Transient.update: invariant violation, empty node where not expected"
+      _ -> error "Data.Vector.Transient.update: invariant violation, not at level 0 but at a leaf"
+  -}
 
 -- TODO, alter transient vector impl to treat length and tailLength as MutVars
 push :: PrimMonad m => TransientVector (PrimState m) a -> a -> m ()
