@@ -4,7 +4,13 @@ module Data.Vector.Transient (
   presized,
   write,
   push,
-  pop
+  pop,
+  read,
+  size
 ) where
 import Data.Vector.Internal.Transient
+import Control.Monad.Primitive
+
+size :: PrimMonad m => TransientVector (PrimState m) a -> m Int
+size = fmap tvCount . getState
 

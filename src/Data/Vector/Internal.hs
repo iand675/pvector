@@ -2,6 +2,7 @@
 {-# LANGUAGE MagicHash              #-}
 {-# LANGUAGE UnboxedTuples          #-}
 module Data.Vector.Internal where
+import Control.Loop
 import Control.Monad.Primitive
 import Control.Monad.State
 import Control.Monad.ST
@@ -159,11 +160,8 @@ makeMutableLeaf = MutableLevel <$> newSmallArray levelSize (error "Data.Persiste
 
 transientLevel :: PrimMonad m => Level (Node a) -> m (MutableLevel (PrimState m) (TransientNode (PrimState m) a))
 transientLevel (Level src) = do
-  counter <- newMutVar 0
   dest <- newSmallArray levelSize EmptyTransientNode
-  replicateM_ levelSize $ do
-    i <- readMutVar counter
+  numLoop 0 (levelSize - 1) $ \i -> do
     writeSmallArray dest i . makeTransientNode $ indexSmallArray src i
-    writeMutVar counter (i + 1)
   return . MutableLevel $ dest
 

@@ -18,13 +18,13 @@ cabal-version:       >=1.10
 
 library
   exposed-modules:     Data.Vector.Persistent,
-                       Data.Vector.Persistent.Unboxed,
-                       Data.Vector.Persistent.Storable,
-                       Data.Vector.Persistent.Primitve,
-                       Data.Vector.Transient,
-                       Data.Vector.Transient.Unboxed,
-                       Data.Vector.Transient.Storable,
-                       Data.Vector.Transient.Primitive
+                       -- Data.Vector.Persistent.Unboxed,
+                       -- Data.Vector.Persistent.Storable,
+                       -- Data.Vector.Persistent.Primitve,
+                       Data.Vector.Transient
+                       -- Data.Vector.Transient.Unboxed,
+                       -- Data.Vector.Transient.Storable,
+                       -- Data.Vector.Transient.Primitive
   other-modules:       Data.Vector.Internal,
                        Data.Vector.Internal.Persistent,
                        Data.Vector.Internal.Transient
@@ -34,7 +34,9 @@ library
                        primitive,
                        ghc-prim,
                        mtl,
-                       vector
+                       vector,
+                       loop
+
   hs-source-dirs:      src
   default-language:    Haskell2010
 
@@ -61,3 +63,12 @@ test-suite vector-behavior
   main-is:          TestAll.hs
   build-depends:    base, QuickCheck, tasty, tasty-quickcheck, pvector
   ghc-options:      -O2 -Wall -threaded
+
+test-suite test-pvectors
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:    base,
+                    pvector,
+                    tasty,
+                    tasty-hunit

@@ -226,9 +226,9 @@ unsnoc v@(Vector{..}) = case vCount of
   0 -> Nothing
   1 -> Just (unsafeIndex v 0, Data.Vector.Internal.Persistent.empty)
   n -> if n - tailOffset v > 1
-    then let newLen = pred vTailCount
+    then let newLen = vTailCount - 1
          in Just ( indexSmallArray vTail newLen
-                 , v { vCount = pred vCount
+                 , v { vCount = vCount - 1
                      , vTail = cloneSmallArray vTail 0 newLen
                      , vTailCount = newLen
                      })
@@ -239,9 +239,9 @@ unsnoc v@(Vector{..}) = case vCount of
                  then (vShift - bitsPerLevel, indexSmallArray arr 0)
                  else (vShift, b)
                leaf -> (vShift, leaf)
-             newLen = pred vCount
+             newLen = vCount - 1
              newTail = unsafeLevelFor v $ vCount - 2
-             newTailCount | sameArray vTail newTail = pred vTailCount
+             newTailCount | sameArray vTail newTail = vTailCount - 1
                           | otherwise = levelSize
          in Just (unsafeIndex v newLen, v { vCount = newLen
                                           , vShift = newShift
@@ -253,27 +253,26 @@ unsnoc v@(Vector{..}) = case vCount of
 popTail :: Vector a -> Int -> Node a -> Maybe (Node a)
 popTail v@(Vector{..}) level node = case node of
   Branch (Level arr) -> if level > bitsPerLevel
-    then case (subIndex, popTail v (level - 5) $ indexSmallArray arr subIndex) of
+    then case (subIndex, popTail v (level - bitsPerLevel) $ indexSmallArray arr subIndex) of
       -- If we're at the front of the current node's array and don't find
       -- a value there, then remove the current node
       (0, Nothing) -> Nothing
       (_, Just newChild) -> runST $ do
-        arr' <- unsafeThawSmallArray arr
-        cloned <- cloneSmallMutableArray arr' 0 ls
+        arr' <- unsafeThawSmallArray arr 
+        cloned <- cloneSmallMutableArray arr' 0 levelSize
         writeSmallArray cloned subIndex newChild
         (Just . Branch . Level) <$> unsafeFreezeSmallArray cloned
     else if subIndex == 0
       then Nothing
       else runST $ do
         thawed <- unsafeThawSmallArray arr
-        ret <- cloneSmallMutableArray thawed 0 ls
+        ret <- cloneSmallMutableArray thawed 0 levelSize
         writeSmallArray ret 0 EmptyNode
         (Just . Branch . Level) <$> unsafeFreezeSmallArray ret
   _ -> Nothing
   where
     -- (vCount - 2) because of zero-based indexing
     subIndex = maskLevel $ shiftR (vCount - 2) level
-    ls = levelSize
 
 -- TODO copy & push tail rather than write one at a time
 concat :: Foldable f => f (Vector a) -> Vector a
@@ -367,7 +366,7 @@ instance Foldable Vector where
       vArrays = Prelude.map (unsafeLevelFor v) vSegments
 
   null v = vCount v == 0
-  length v = vCount v
+  length = vCount
 
 -- check n = let v = foldl (|>) Data.PersistentVector.empty [0..n] in if (foldr (:) [] v) == [0..n]
   -- then Right ()
