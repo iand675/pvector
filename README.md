@@ -1,12 +1,80 @@
-# pcontainers
-Experimental implementations of persistent containers for Haskell, inspired by Clojure.
+# Persistent Vectors for Haskell
 
-## Persistent vectors
-
-## Persistent maps
-
-## Persistent maps with "indestructable" keys
-
-## Array maps
-
-## Sets
+- [ ] Test mutable version 
+- [ ] Test persistent version
+- [ ] Test freezing and thawing
+- [ ] Benchmarks vs. lists, `Vector`, and `Seq`.
+- [ ] Fusion rules / other rewrite rules
+- [ ] Sorting algorithms
+- [ ] List-like operations:
+  - [ ] `intercalate`
+  - [ ] `transpose`
+  - [ ] `subsequences`
+  - [ ] `permutations`
+  - [ ] `unfoldl` (a little bit different)
+  - [ ] `take`
+  - [ ] `drop`
+  - [ ] `splitAt`
+  - [ ] `takeWhile`
+  - [ ] `dropWhile`
+  - [ ] `span`
+  - [ ] `break`
+  - [ ] `stripPrefix`
+  - [ ] `group`
+  - [ ] `inits`
+  - [ ] `tails`
+  - [ ] `isPrefixOf`
+  - [ ] `isSuffixOf`
+  - [ ] `isInfixOf`
+  - [ ] `elem`
+  - [ ] `notElem`
+  - [ ] `lookup`
+  - [ ] `find`
+  - [ ] `filter`
+  - [ ] `partition`
+  - [ ] `zip`
+  - [ ] `zip3`
+  - [ ] `zip4`
+  - [ ] `zip5`
+  - [ ] `zip6`
+  - [ ] `zip7`
+  - [ ] `zipWith`
+  - [ ] `zipWith2`
+  - [ ] `zipWith3`
+  - [ ] `zipWith4`
+  - [ ] `zipWith5`
+  - [ ] `zipWith6`
+  - [ ] `zipWith7`
+  - [ ] `unzip`
+  - [ ] `unzip3`
+  - [ ] `unzip4`
+  - [ ] `unzip5`
+  - [ ] `unzip6`
+  - [ ] `unzip7`
+  - [ ] `lines`
+  - [ ] `words`
+  - [ ] `unlines`
+  - [ ] `unwords`
+  - [ ] `nub`
+  - [ ] `delete`
+  - [ ] `\\`
+  - [ ] `union`
+  - [ ] `intersect`
+  - [ ] `sort`
+  - [ ] `insert`
+  - [ ] `nubBy`
+  - [ ] `deleteBy`
+  - [ ] `deleteFirstsBy`
+  - [ ] `unionBy`
+  - [ ] `intersectBy`
+  - [ ] `groupBy`
+  - [ ] `sortBy`
+  - [ ] `insertBy`
+  - [ ] `maximumBy`
+  - [ ] `minimumBy`
+  - [ ] `genericLength`
+  - [ ] `genericTake`
+  - [ ] `genericDrop`
+  - [ ] `genericSplitAt`
+  - [ ] `genericIndex`
+  - [ ] `genericReplicate`
