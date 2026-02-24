@@ -238,6 +238,38 @@ backVectorTests = testGroup "Data.PVector.Back"
         xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
         let v = V.fromList xs
         V.toList (V.reverse (V.reverse v)) Hedgehog.=== xs
+    , testProperty "take/drop partition" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 300) (Gen.int (Range.linear 0 10000))
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 (Prelude.length xs + 10))
+        let v = V.fromList xs
+        (V.toList (V.take n v) ++ V.toList (V.drop n v)) Hedgehog.=== xs
+    , testProperty "append is concatenation" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        let v1 = V.fromList xs
+            v2 = V.fromList ys
+        V.toList (v1 <> v2) Hedgehog.=== (xs ++ ys)
+    , testProperty "length after snoc" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 300) (Gen.int (Range.linear 0 10000))
+        x <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v = V.fromList xs
+        V.length (V.snoc v x) Hedgehog.=== Prelude.length xs + 1
+    , testProperty "replicate n x has n elements all equal to x" $ Hedgehog.property $ do
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 200)
+        x <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v = V.replicate n x
+        V.length v Hedgehog.=== n
+        V.toList v Hedgehog.=== Prelude.replicate n x
+    , testProperty "generate n f == fromList (map f [0..n-1])" $ Hedgehog.property $ do
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 200)
+        let v = V.generate n (* 2)
+        V.toList v Hedgehog.=== Prelude.map (* 2) [0..n-1]
+    , testProperty "zipWith is pairwise" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 100))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 100))
+        let v1 = V.fromList xs
+            v2 = V.fromList ys
+        V.toList (V.zipWith (+) v1 v2) Hedgehog.=== Prelude.zipWith (+) xs ys
     ]
   ]
 
