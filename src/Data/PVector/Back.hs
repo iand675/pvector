@@ -117,7 +117,6 @@ import Prelude hiding
   )
 import qualified Prelude
 import qualified Data.Foldable as F
-import qualified Data.List as L
 
 ------------------------------------------------------------------------
 -- Vector type
@@ -849,9 +848,6 @@ mPushTail size shift root tailArr = go shift root
     go level node = do
       arr <- editableInternal node
       let !subIdx = indexAtLevel (size - 1) level
-          !newChild
-            | level == bfBits = Frozen (Leaf tailArr)
-            | otherwise       = Frozen Empty
       if level == bfBits
         then do
           writeSmallArray arr subIdx (Frozen (Leaf tailArr))
@@ -869,22 +865,31 @@ mPushTail size shift root tailArr = go shift root
               pure (MInternal arr)
 
 -- | O(1) amortized. Remove and return the last element.
+-- Note: this implementation freezes then re-thaws. For batch removals,
+-- use the persistent 'unsnoc' directly.
 mPop :: PrimMonad m => MVector (PrimState m) a -> m (Maybe a)
 mPop mv = do
   st <- getMV mv
   let !n = mvSize st
+      !ts = mvTailSize st
   if n == 0
     then pure Nothing
-    else do
-      x <- mRead mv (n - 1)
-      v <- unsafeFreeze mv
-      case unsnoc v of
-        Nothing -> pure Nothing
-        Just (v', _) -> do
-          mv' <- thaw v'
-          st' <- getMV mv'
-          putMV mv st'
-          pure (Just x)
+    else if ts > 1
+      then do
+        let !newTs = ts - 1
+        x <- readSmallArray (mvTail st) newTs
+        putMV mv st { mvSize = n - 1, mvTailSize = newTs }
+        pure (Just x)
+      else do
+        x <- readSmallArray (mvTail st) 0
+        v <- unsafeFreeze mv
+        case unsnoc v of
+          Nothing -> pure Nothing
+          Just (v', _) -> do
+            mv' <- thaw v'
+            st' <- getMV mv'
+            putMV mv st'
+            pure (Just x)
 {-# INLINE mPop #-}
 
 ------------------------------------------------------------------------
@@ -921,7 +926,7 @@ stream v = Stream step (SInit 0) (Exact n)
     step (STail j)
       | j >= tailSz = Done
       | otherwise   = Yield (indexSmallArray tail_ j) (STail (j + 1))
-{-# INLINE [1] stream #-}
+{-# INLINE [0] stream #-}
 
 data SState a
   = SInit  {-# UNPACK #-} !Int
@@ -937,7 +942,7 @@ unstream (Stream step s0 _sz) = runST $ do
         Skip    s' -> go s'
         Yield a s' -> mPush mv a >> go s'
   go s0
-{-# INLINE [1] unstream #-}
+{-# INLINE [0] unstream #-}
 
 ------------------------------------------------------------------------
 -- Rewrite rules
