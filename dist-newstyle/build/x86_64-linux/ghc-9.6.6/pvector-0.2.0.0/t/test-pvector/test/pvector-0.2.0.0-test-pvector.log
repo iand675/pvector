@@ -1,0 +1,3 @@
+Test suite test-pvector: RUNNING...
+Test suite test-pvector: PASS
+Test suite logged to: /workspace/./dist-newstyle/build/x86_64-linux/ghc-9.6.6/pvector-0.2.0.0/t/test-pvector/test/pvector-0.2.0.0-test-pvector.log
