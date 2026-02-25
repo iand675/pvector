@@ -174,6 +174,7 @@ module Data.PVector.Back
     -- * Internal (used by Front/Deque)
   , rfoldl'
   , rfoldr
+  , forEach_
   , vSize, vShift, vRoot, vTail
   ) where
 
@@ -251,27 +252,57 @@ instance Show a => Show (Vector a) where
 instance Eq a => Eq (Vector a) where
   v1 == v2
     | length v1 /= length v2 = False
-    | otherwise = eqChunks v1 v2
+    | otherwise = eqNodes (vShift v1) (vRoot v1) (vRoot v2)
+                  && eqArrays (vTail v1) (vTail v2) 0 (sizeofSmallArray (vTail v1))
 
-eqChunks :: Eq a => Vector a -> Vector a -> Bool
-eqChunks v1 v2 = go 0
+eqArrays :: Eq a => SmallArray a -> SmallArray a -> Int -> Int -> Bool
+eqArrays a1 a2 !i !n
+  | i >= n    = True
+  | otherwise = indexSmallArray a1 i == indexSmallArray a2 i && eqArrays a1 a2 (i + 1) n
+
+eqNodes :: Eq a => Int -> Node a -> Node a -> Bool
+eqNodes _ Empty Empty = True
+eqNodes _ (Leaf a1) (Leaf a2) = eqArrays a1 a2 0 (sizeofSmallArray a1)
+eqNodes shift (Internal a1) (Internal a2) = go 0
   where
-    !n = vSize v1
-    go i
-      | i >= n    = True
-      | otherwise = unsafeIndex v1 i == unsafeIndex v2 i && go (i + 1)
+    !n = sizeofSmallArray a1
+    go i | i >= n = True
+         | otherwise = eqNodes (shift - bfBits) (indexSmallArray a1 i) (indexSmallArray a2 i)
+                       && go (i + 1)
+eqNodes _ _ _ = False
 
 instance Ord a => Ord (Vector a) where
-  compare v1 v2 = go 0
+  compare v1 v2 =
+    case cmpNodes (vShift v1) (vRoot v1) (vRoot v2) of
+      EQ -> case cmpArrays (vTail v1) (vTail v2) 0 (min ts1 ts2) of
+              EQ -> compare (vSize v1) (vSize v2)
+              x  -> x
+      x  -> x
     where
-      !n1 = vSize v1
-      !n2 = vSize v2
-      !n  = min n1 n2
-      go i
-        | i >= n = compare n1 n2
-        | otherwise = case compare (unsafeIndex v1 i) (unsafeIndex v2 i) of
-            EQ -> go (i + 1)
-            x  -> x
+      !ts1 = sizeofSmallArray (vTail v1)
+      !ts2 = sizeofSmallArray (vTail v2)
+
+cmpArrays :: Ord a => SmallArray a -> SmallArray a -> Int -> Int -> Ordering
+cmpArrays a1 a2 !i !n
+  | i >= n    = EQ
+  | otherwise = case compare (indexSmallArray a1 i) (indexSmallArray a2 i) of
+      EQ -> cmpArrays a1 a2 (i + 1) n
+      x  -> x
+
+cmpNodes :: Ord a => Int -> Node a -> Node a -> Ordering
+cmpNodes _ Empty Empty = EQ
+cmpNodes _ Empty _     = LT
+cmpNodes _ _     Empty = GT
+cmpNodes _ (Leaf a1) (Leaf a2) = cmpArrays a1 a2 0 (min (sizeofSmallArray a1) (sizeofSmallArray a2))
+cmpNodes shift (Internal a1) (Internal a2) = go 0
+  where
+    !n = min (sizeofSmallArray a1) (sizeofSmallArray a2)
+    go i | i >= n = EQ
+         | otherwise = case cmpNodes (shift - bfBits) (indexSmallArray a1 i) (indexSmallArray a2 i) of
+              EQ -> go (i + 1)
+              x  -> x
+cmpNodes _ (Leaf _) (Internal _) = LT
+cmpNodes _ (Internal _) (Leaf _) = GT
 
 instance Semigroup (Vector a) where
   (<>) = append
@@ -307,7 +338,7 @@ instance F.Foldable Vector where
   {-# INLINE toList #-}
 
 instance Traversable Vector where
-  traverse f v = fromList <$> Prelude.traverse f (toList v)
+  traverse f v = foldl' (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) v
   {-# INLINE traverse #-}
 
 instance Exts.IsList (Vector a) where
@@ -417,7 +448,7 @@ unfoldrN n f s0 = create $ \mv ->
 cons :: a -> Vector a -> Vector a
 cons x v = create $ \mv -> do
   mPush mv x
-  forI_ v $ \_ a -> mPush mv a
+  forEach_ v $ \a -> mPush mv a
 {-# INLINE cons #-}
 
 snoc :: Vector a -> a -> Vector a
@@ -464,7 +495,7 @@ snoc v x
 concat :: [Vector a] -> Vector a
 concat vs = create $ \mv ->
   let go []     = pure ()
-      go (v:vs') = forI_ v (\_ a -> mPush mv a) >> go vs'
+      go (v:vs') = forEach_ v (mPush mv) >> go vs'
   in go vs
 {-# INLINE concat #-}
 
@@ -686,12 +717,12 @@ imap f v = generate (vSize v) (\i -> f i (unsafeIndex v i))
 
 concatMap :: (a -> Vector b) -> Vector a -> Vector b
 concatMap f v = create $ \mv ->
-  forI_ v $ \_ a -> forI_ (f a) $ \_ b -> mPush mv b
+  forEach_ v $ \a -> forEach_ (f a) $ \b -> mPush mv b
 {-# INLINE concatMap #-}
 
 mapMaybe :: (a -> Maybe b) -> Vector a -> Vector b
 mapMaybe f v = create $ \mv ->
-  forI_ v $ \_ a -> case f a of
+  forEach_ v $ \a -> case f a of
     Nothing -> pure ()
     Just b  -> mPush mv b
 {-# INLINE mapMaybe #-}
@@ -708,31 +739,27 @@ imapMaybe f v = create $ \mv ->
 ------------------------------------------------------------------------
 
 mapM :: Monad m => (a -> m b) -> Vector a -> m (Vector b)
-mapM f v = fromList <$> Prelude.mapM f (toList v)
+mapM f v = foldl' (\acc a -> acc >>= \v' -> f a >>= \b -> pure (snoc v' b)) (pure empty) v
 {-# INLINE mapM #-}
 
 mapM_ :: Monad m => (a -> m b) -> Vector a -> m ()
-mapM_ f v = Prelude.mapM_ f (toList v)
+mapM_ f = foldl' (\m a -> m >> f a >> pure ()) (pure ())
 {-# INLINE mapM_ #-}
 
 forM :: Monad m => Vector a -> (a -> m b) -> m (Vector b)
-forM v f = mapM f v
+forM = flip mapM
 {-# INLINE forM #-}
 
 forM_ :: Monad m => Vector a -> (a -> m b) -> m ()
-forM_ v f = mapM_ f v
+forM_ = flip mapM_
 {-# INLINE forM_ #-}
 
 imapM :: Monad m => (Int -> a -> m b) -> Vector a -> m (Vector b)
-imapM f v = fromList <$> Prelude.mapM (\i -> f i (unsafeIndex v i)) [0 .. vSize v - 1]
+imapM f v = ifoldl' (\acc i a -> acc >>= \v' -> f i a >>= \b -> pure (snoc v' b)) (pure empty) v
 {-# INLINE imapM #-}
 
 imapM_ :: Monad m => (Int -> a -> m ()) -> Vector a -> m ()
-imapM_ f v = go 0
-  where
-    !n = vSize v
-    go i | i >= n = pure ()
-         | otherwise = f i (unsafeIndex v i) >> go (i + 1)
+imapM_ f = ifoldl' (\m i a -> m >> f i a) (pure ())
 {-# INLINE imapM_ #-}
 
 ------------------------------------------------------------------------
@@ -870,7 +897,7 @@ findIndex p v = go 0
 
 findIndices :: (a -> Bool) -> Vector a -> Vector Int
 findIndices p v = create $ \mv ->
-  forI_ v $ \i a -> when (p a) (mPush mv i)
+  forI_ v $ \i a -> when (p a) (mPush mv (i :: Int))
 {-# INLINE findIndices #-}
 
 elemIndex :: Eq a => a -> Vector a -> Maybe Int
@@ -926,13 +953,31 @@ foldArr f = go
 foldl1 :: (a -> a -> a) -> Vector a -> a
 foldl1 f v
   | vSize v == 0 = error "Data.PVector.Back.foldl1: empty"
-  | otherwise     = foldl f (unsafeIndex v 0) (drop 1 v)
+  | otherwise     = foldl1ViaNode f (vShift v) (vRoot v) (vTail v)
 
 foldl1' :: (a -> a -> a) -> Vector a -> a
 foldl1' f v
   | vSize v == 0 = error "Data.PVector.Back.foldl1': empty"
-  | otherwise     = foldl' f (unsafeIndex v 0) (drop 1 v)
+  | otherwise     = foldl1ViaNode f (vShift v) (vRoot v) (vTail v)
 {-# INLINE foldl1' #-}
+
+foldl1ViaNode :: (a -> a -> a) -> Int -> Node a -> SmallArray a -> a
+foldl1ViaNode f shift root tail_ =
+  let (!z, !started) = firstElemNode shift root
+  in if started
+     then foldArr f (foldNode f z shift root) tail_ 0 tailSz
+     else case tailSz of
+            0 -> error "Data.PVector.Back.foldl1: empty"
+            _ -> foldArr f (indexSmallArray tail_ 0) tail_ 1 tailSz
+  where
+    !tailSz = sizeofSmallArray tail_
+    firstElemNode _ Empty = (error "pvector: no first elem", False)
+    firstElemNode _ (Leaf arr)
+      | sizeofSmallArray arr > 0 = (indexSmallArray arr 0, True)
+      | otherwise = (error "pvector: no first elem", False)
+    firstElemNode lev (Internal arr)
+      | sizeofSmallArray arr > 0 = firstElemNode (lev - bfBits) (indexSmallArray arr 0)
+      | otherwise = (error "pvector: no first elem", False)
 
 foldr :: (a -> b -> b) -> b -> Vector a -> b
 foldr f z = foldrDirect f z
@@ -975,13 +1020,15 @@ foldr' f z0 v = foldl' (\k x -> k . f x) id v z0
 foldr1 :: (a -> a -> a) -> Vector a -> a
 foldr1 f v
   | vSize v == 0 = error "Data.PVector.Back.foldr1: empty"
-  | otherwise     = foldr f (Data.PVector.Back.last v) (Data.PVector.Back.init v)
+  | otherwise     = foldr f (Data.PVector.Back.last v)
+                           (Data.PVector.Back.take (vSize v - 1) v)
 {-# INLINE foldr1 #-}
 
 foldr1' :: (a -> a -> a) -> Vector a -> a
 foldr1' f v
   | vSize v == 0 = error "Data.PVector.Back.foldr1': empty"
-  | otherwise     = foldr' f (Data.PVector.Back.last v) (Data.PVector.Back.init v)
+  | otherwise     = foldr' f (Data.PVector.Back.last v)
+                            (Data.PVector.Back.take (vSize v - 1) v)
 
 ifoldl' :: (b -> Int -> a -> b) -> b -> Vector a -> b
 ifoldl' f z0 v
@@ -1142,8 +1189,29 @@ scanr f z v = generate (vSize v + 1) step
 {-# INLINE scanr #-}
 
 scanr' :: (a -> b -> b) -> b -> Vector a -> Vector b
-scanr' f z v = reverse (scanl' (flip f) z (reverse v))
+scanr' f z v = create $ \mv -> do
+  let !n = vSize v
+      go !acc i
+        | i < 0     = mPush mv acc
+        | otherwise = mPush mv acc >> go (f (unsafeIndex v i) acc) (i - 1)
+  go z (n - 1)
+  -- result is in reverse, need to reverse in-place
+  reverseM mv
 {-# INLINE scanr' #-}
+
+reverseM :: MVector s a -> ST s ()
+reverseM mv = do
+  st <- getMV mv
+  let !n = mvSize st
+      go !lo !hi
+        | lo >= hi = pure ()
+        | otherwise = do
+            a <- mRead mv lo
+            b <- mRead mv hi
+            mWrite mv lo b
+            mWrite mv hi a
+            go (lo + 1) (hi - 1)
+  go 0 (n - 1)
 
 scanr1 :: (a -> a -> a) -> Vector a -> Vector a
 scanr1 f v
@@ -1275,22 +1343,69 @@ forChunks_ v f
 -- Internal helpers
 ------------------------------------------------------------------------
 
--- | Iterate over all elements with index, performing an ST action.
+-- | Iterate over all elements with index via direct tree walk.
 forI_ :: Vector a -> (Int -> a -> ST s ()) -> ST s ()
-forI_ v f = go 0
-  where
-    !n = vSize v
-    go i | i >= n = pure ()
-         | otherwise = f i (unsafeIndex v i) >> go (i + 1)
+forI_ v f
+  | n == 0    = pure ()
+  | otherwise = do
+      off <- forNodeI_ f 0 (vShift v) (vRoot v)
+      forArrI_ f off (vTail v) 0 (sizeofSmallArray (vTail v))
+      pure ()
+  where !n = vSize v
 {-# INLINE forI_ #-}
+
+forNodeI_ :: (Int -> a -> ST s ()) -> Int -> Int -> Node a -> ST s Int
+forNodeI_ _ off _ Empty = pure off
+forNodeI_ f off _ (Leaf arr) = forArrI_ f off arr 0 (sizeofSmallArray arr)
+forNodeI_ f off level (Internal arr) = do
+  let !n = sizeofSmallArray arr
+      go !o !i
+        | i >= n = pure o
+        | otherwise = do
+            o' <- forNodeI_ f o (level - bfBits) (indexSmallArray arr i)
+            go o' (i + 1)
+  go off 0
+
+forArrI_ :: (Int -> a -> ST s ()) -> Int -> SmallArray a -> Int -> Int -> ST s Int
+forArrI_ f = go
+  where
+    go !off !arr !i !limit
+      | i >= limit = pure off
+      | otherwise = f off (indexSmallArray arr i) >> go (off + 1) arr (i + 1) limit
+
+-- | Iterate over all elements via direct tree walk (no index).
+forEach_ :: Vector a -> (a -> ST s ()) -> ST s ()
+forEach_ v f
+  | vSize v == 0 = pure ()
+  | otherwise = do
+      forNode_ f (vShift v) (vRoot v)
+      forArr_ f (vTail v) 0 (sizeofSmallArray (vTail v))
+{-# INLINE forEach_ #-}
+
+forNode_ :: (a -> ST s ()) -> Int -> Node a -> ST s ()
+forNode_ _ _ Empty = pure ()
+forNode_ f _ (Leaf arr) = forArr_ f arr 0 (sizeofSmallArray arr)
+forNode_ f level (Internal arr) = do
+  let !n = sizeofSmallArray arr
+      go !i
+        | i >= n = pure ()
+        | otherwise = forNode_ f (level - bfBits) (indexSmallArray arr i) >> go (i + 1)
+  go 0
+
+forArr_ :: (a -> ST s ()) -> SmallArray a -> Int -> Int -> ST s ()
+forArr_ f arr = go
+  where
+    go !i !limit
+      | i >= limit = pure ()
+      | otherwise = f (indexSmallArray arr i) >> go (i + 1) limit
 
 append :: Vector a -> Vector a -> Vector a
 append v1 v2
   | null v1   = v2
   | null v2   = v1
   | otherwise = create $ \mv -> do
-      forI_ v1 $ \_ a -> mPush mv a
-      forI_ v2 $ \_ a -> mPush mv a
+      forEach_ v1 (mPush mv)
+      forEach_ v2 (mPush mv)
 {-# INLINE append #-}
 
 ------------------------------------------------------------------------

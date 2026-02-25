@@ -58,13 +58,13 @@ import Control.DeepSeq (NFData(..))
 import qualified GHC.Exts as Exts
 import GHC.Base (build)
 
+import Control.Monad (when)
 import qualified Data.PVector.Back as B
 
 import Prelude hiding
   ( null, length, head, last, map, filter, reverse
   , foldMap, tail, init, foldr, foldl'
   )
-import qualified Data.List as L
 import qualified Data.Foldable as F
 
 -- | A double-ended persistent vector.
@@ -85,13 +85,27 @@ instance Show a => Show (Deque a) where
   showsPrec p d = showsPrec p (toList d)
 
 instance Eq a => Eq (Deque a) where
-  a == b = toList a == toList b
+  Deque f1 b1 == Deque f2 b2
+    | length (Deque f1 b1) /= length (Deque f2 b2) = False
+    | otherwise = B.rfoldl' (\ok x -> ok && x) True (B.zipWith (==) f1 f2)
+                  && b1 == b2
 
 instance Ord a => Ord (Deque a) where
-  compare a b = compare (toList a) (toList b)
+  compare d1 d2 = go 0
+    where
+      !n1 = length d1
+      !n2 = length d2
+      !n = min n1 n2
+      go i | i >= n = compare n1 n2
+           | otherwise = case compare (index d1 i) (index d2 i) of
+               EQ -> go (i + 1)
+               x  -> x
 
 instance Semigroup (Deque a) where
-  a <> b = fromList (toList a ++ toList b)
+  Deque f1 b1 <> Deque f2 b2 = Deque f1 (B.create $ \mv -> do
+    B.forEach_ b1 (B.mPush mv)
+    B.rfoldr (\a rest -> B.mPush mv a >> rest) (pure ()) f2
+    B.forEach_ b2 (B.mPush mv))
 
 instance Monoid (Deque a) where
   mempty = empty
@@ -108,7 +122,7 @@ instance F.Foldable Deque where
   toList  = Data.PVector.Deque.toList
 
 instance Traversable Deque where
-  traverse f d = fromList <$> traverse f (toList d)
+  traverse f d = foldl' (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) d
 
 instance Exts.IsList (Deque a) where
   type Item (Deque a) = a
@@ -288,7 +302,11 @@ map f (Deque fr bk) = Deque (B.map f fr) (B.map f bk)
 
 -- | O(n).
 filter :: (a -> Bool) -> Deque a -> Deque a
-filter p d = fromList (L.filter p (toList d))
+filter p d = Deque B.empty (B.create $ \mv ->
+  let go (Deque fr bk) = do
+        B.rfoldr (\a rest -> when (p a) (B.mPush mv a) >> rest) (pure ()) fr
+        B.forEach_ bk $ \a -> when (p a) (B.mPush mv a)
+  in go d)
 {-# INLINE filter #-}
 
 -- | O(n).
@@ -329,5 +347,7 @@ toList d = build (\c n -> Data.PVector.Deque.foldr c n d)
 
 -- | O(n). Flatten into a single back vector.
 toBackVector :: Deque a -> B.Vector a
-toBackVector d = B.fromList (toList d)
+toBackVector (Deque f b) = B.create $ \mv -> do
+  B.rfoldr (\a rest -> B.mPush mv a >> rest) (pure ()) f
+  B.forEach_ b (B.mPush mv)
 {-# INLINE toBackVector #-}

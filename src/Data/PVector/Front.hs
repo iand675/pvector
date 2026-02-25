@@ -6,10 +6,6 @@
 -- Internally this is a 'Data.PVector.Back.Vector' with reversed
 -- element ordering: @cons@ maps to @snoc@ on the underlying vector,
 -- and index @i@ maps to @n − 1 − i@ internally.
---
--- * @cons@  — O(1) amortized
--- * @head@  — O(1)
--- * @index@ — O(log₃₂ n)
 module Data.PVector.Front
   ( FrontVector
 
@@ -57,6 +53,7 @@ module Data.PVector.Front
   ) where
 
 import Control.DeepSeq (NFData(..))
+import Control.Monad.ST (ST)
 import qualified GHC.Exts as Exts
 import GHC.Base (build)
 
@@ -66,26 +63,25 @@ import Prelude hiding
   ( null, length, head, last, map, filter, reverse, take, drop
   , foldMap, tail, init, foldr, foldl'
   )
-import qualified Data.List as L
 import qualified Data.Foldable as F
 
 newtype FrontVector a = FrontVector (B.Vector a)
-
-------------------------------------------------------------------------
--- Instances
-------------------------------------------------------------------------
 
 instance Show a => Show (FrontVector a) where
   showsPrec p v = showsPrec p (toList v)
 
 instance Eq a => Eq (FrontVector a) where
-  v1 == v2 = toList v1 == toList v2
+  FrontVector v1 == FrontVector v2
+    | B.length v1 /= B.length v2 = False
+    | otherwise = B.rfoldl' (\ok a -> ok && a) True (B.zipWith (==) v1 v2)
 
 instance Ord a => Ord (FrontVector a) where
   compare v1 v2 = compare (toList v1) (toList v2)
 
 instance Semigroup (FrontVector a) where
-  a <> b = fromList (toList a Prelude.++ toList b)
+  FrontVector a <> FrontVector b = FrontVector $ B.create $ \mv -> do
+    B.forEach_ a (B.mPush mv)
+    B.forEach_ b (B.mPush mv)
   {-# INLINE (<>) #-}
 
 instance Monoid (FrontVector a) where
@@ -111,7 +107,10 @@ instance F.Foldable FrontVector where
   {-# INLINE toList #-}
 
 instance Traversable FrontVector where
-  traverse f v = fromList <$> Prelude.traverse f (toList v)
+  traverse f v = foldl' (\acc a -> B.snoc <$> acc <*> f a) (Prelude.pure B.empty) v
+    <&> FrontVector
+    where
+      (<&>) = flip Prelude.fmap
 
 instance Exts.IsList (FrontVector a) where
   type Item (FrontVector a) = a
@@ -133,9 +132,20 @@ singleton :: a -> FrontVector a
 singleton x = FrontVector (B.singleton x)
 {-# INLINE singleton #-}
 
+-- | Build from a list. The first list element becomes the head.
+-- Internally reverses into the underlying back vector.
 fromList :: [a] -> FrontVector a
-fromList xs = FrontVector (B.fromList (L.reverse xs))
+fromList xs = FrontVector $ B.create $ \mv ->
+  let collect []     acc = pushAll mv acc
+      collect (a:as) acc = collect as (a : acc)
+  in collect xs []
 {-# INLINE fromList #-}
+
+pushAll :: B.MVector s a -> [a] -> ST s ()
+pushAll mv = go
+  where
+    go []     = pure ()
+    go (a:as) = B.mPush mv a >> go as
 
 cons :: a -> FrontVector a -> FrontVector a
 cons x (FrontVector v) = FrontVector (B.snoc v x)
@@ -145,8 +155,11 @@ cons x (FrontVector v) = FrontVector (B.snoc v x)
 (<|) = cons
 {-# INLINE (<|) #-}
 
+-- | Append to the back. O(n) since the underlying vector must be rebuilt.
 snoc :: FrontVector a -> a -> FrontVector a
-snoc fv x = fromList (toList fv Prelude.++ [x])
+snoc (FrontVector v) x = FrontVector $ B.create $ \mv -> do
+  B.mPush mv x
+  B.forEach_ v (B.mPush mv)
 {-# INLINE snoc #-}
 
 ------------------------------------------------------------------------
@@ -202,11 +215,12 @@ uncons (FrontVector v) = case B.unsnoc v of
 {-# INLINE uncons #-}
 
 unsnoc :: FrontVector a -> Maybe (FrontVector a, a)
-unsnoc fv = case toList fv of
-  [] -> Nothing
-  xs -> let !l = L.last xs
-            !i = fromList (L.init xs)
-        in Just (i, l)
+unsnoc (FrontVector v)
+  | B.length v == 0 = Nothing
+  | otherwise =
+      let !x = B.head v
+          !v' = B.drop 1 v
+      in Just (FrontVector v', x)
 {-# INLINE unsnoc #-}
 
 tail :: FrontVector a -> FrontVector a
@@ -230,7 +244,8 @@ map f (FrontVector v) = FrontVector (B.map f v)
 {-# INLINE map #-}
 
 filter :: (a -> Bool) -> FrontVector a -> FrontVector a
-filter p fv = fromList (L.filter p (toList fv))
+filter p (FrontVector v) = FrontVector $ B.create $ \mv ->
+  B.rfoldr (\a rest -> (if p a then B.mPush mv a else pure ()) >> rest) (pure ()) v
 {-# INLINE filter #-}
 
 reverse :: FrontVector a -> FrontVector a
@@ -238,17 +253,17 @@ reverse (FrontVector v) = FrontVector v
 {-# INLINE reverse #-}
 
 take :: Int -> FrontVector a -> FrontVector a
-take n fv
-  | n <= 0          = empty
-  | n >= length fv  = fv
-  | otherwise       = fromList (L.take n (toList fv))
+take n (FrontVector v)
+  | n <= 0        = empty
+  | n >= B.length v = FrontVector v
+  | otherwise     = FrontVector (B.drop (B.length v - n) v)
 {-# INLINE take #-}
 
 drop :: Int -> FrontVector a -> FrontVector a
-drop n fv
-  | n <= 0          = fv
-  | n >= length fv  = empty
-  | otherwise       = fromList (L.drop n (toList fv))
+drop n (FrontVector v)
+  | n <= 0        = FrontVector v
+  | n >= B.length v = empty
+  | otherwise     = FrontVector (B.take (B.length v - n) v)
 {-# INLINE drop #-}
 
 ------------------------------------------------------------------------
