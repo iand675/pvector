@@ -10,4 +10,7 @@ module Data.PVector
   ( module Data.PVector.Back
   ) where
 
-import Data.PVector.Back hiding (vSize, vShift, vRoot, vTail, forEach_)
+import Data.PVector.Back hiding
+  ( vSize, vShift, vRoot, vTail, forEach_
+  , New(..), new, clone, fill, updateNew, mapNew, transformNew, inplace_map
+  )

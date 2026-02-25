@@ -116,6 +116,30 @@ main = defaultMain
       ]
     | n <- sizes
     ]
+  , bgroup "recycling: v // ps // qs"
+    [ env (setupRecycle n) $ \ ~(pvec, ps, qs) ->
+      bgroup (show n)
+      [ bench "two separate //" $ nf (\v -> (v P.// ps) P.// qs) pvec
+      , bench "single // (merged)" $ nf (\v -> v P.// (ps Prelude.++ qs)) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "recycling: map (+1) (v // ps)"
+    [ env (setupRecycle n) $ \ ~(pvec, ps, _) ->
+      bgroup (show n)
+      [ bench "map then //" $ nf (\v -> P.map (+1) (v P.// ps)) pvec
+      , bench "// then map" $ nf (\v -> P.map (+1) v P.// ps) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "recycling: map (+1) . map (*2)"
+    [ env (setupEnv n) $ \ ~(_xs, _vec, pvec) ->
+      bgroup (show n)
+      [ bench "Vector" $ nf (V.map (+1) . V.map (*2)) (V.fromList [1..n])
+      , bench "PVector (fused)" $ nf (P.map (+1) . P.map (*2)) pvec
+      ]
+    | n <- sizes
+    ]
   ]
 
 sizes :: [Int]
@@ -127,3 +151,10 @@ setupEnv n = do
       !vec = V.fromList xs
       !pvec = P.fromList xs
   pure (xs, vec, pvec)
+
+setupRecycle :: Int -> IO (P.Vector Int, [(Int, Int)], [(Int, Int)])
+setupRecycle n = do
+  let !pvec = P.fromList [1..n]
+      !ps = force [(i, i * 10) | i <- [0, 3 .. n - 1]]
+      !qs = force [(i, i * 20) | i <- [1, 4 .. n - 1]]
+  pure (pvec, ps, qs)

@@ -20,6 +20,10 @@ module Data.PVector.Internal
   , editableInternal
   , editableLeaf
 
+    -- * In-place mutable trie operations
+  , mMapNodeInPlace
+  , mapMutableArr
+
     -- * Array helpers
   , emptyRoot
   , emptyTail
@@ -136,6 +140,59 @@ editableLeaf (MLeaf arr) = pure arr
 editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 (sizeofSmallArray arr)
 editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 {-# INLINABLE editableLeaf #-}
+
+------------------------------------------------------------------------
+-- In-place mutable trie operations
+------------------------------------------------------------------------
+
+-- | Apply a function to every element of a mutable trie node in-place.
+-- Frozen nodes are cloned-on-write. Returns the (possibly new) node.
+mMapNodeInPlace :: PrimMonad m => (a -> a) -> Int -> MNode (PrimState m) a -> m (MNode (PrimState m) a)
+mMapNodeInPlace _ _ n@(Frozen Empty) = pure n
+mMapNodeInPlace f _ (MLeaf arr) = do
+  n <- getSizeofSmallMutableArray arr
+  mapMutableArr f arr 0 n
+  pure (MLeaf arr)
+mMapNodeInPlace f _ (Frozen (Leaf arr)) = do
+  let !n = sizeofSmallArray arr
+  marr <- thawSmallArray arr 0 n
+  mapMutableArr f marr 0 n
+  pure (MLeaf marr)
+mMapNodeInPlace f shift (MInternal arr) = do
+  n <- getSizeofSmallMutableArray arr
+  let go i
+        | i >= n    = pure ()
+        | otherwise = do
+            child <- readSmallArray arr i
+            child' <- mMapNodeInPlace f (shift - bfBits) child
+            writeSmallArray arr i child'
+            go (i + 1)
+  go 0
+  pure (MInternal arr)
+mMapNodeInPlace f shift (Frozen (Internal arr)) = do
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n (Frozen Empty)
+  let go i
+        | i >= n    = pure ()
+        | otherwise = do
+            child' <- mMapNodeInPlace f (shift - bfBits) (Frozen (indexSmallArray arr i))
+            writeSmallArray marr i child'
+            go (i + 1)
+  go 0
+  pure (MInternal marr)
+{-# INLINABLE mMapNodeInPlace #-}
+
+-- | Apply a function to elements [i..n) of a mutable array in-place.
+mapMutableArr :: PrimMonad m => (a -> a) -> SmallMutableArray (PrimState m) a -> Int -> Int -> m ()
+mapMutableArr f arr = go
+  where
+    go !i !n
+      | i >= n    = pure ()
+      | otherwise = do
+          x <- readSmallArray arr i
+          writeSmallArray arr i (f x)
+          go (i + 1) n
+{-# INLINE mapMutableArr #-}
 
 ------------------------------------------------------------------------
 -- Array helpers

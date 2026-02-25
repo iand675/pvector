@@ -85,7 +85,6 @@ module Data.PVector.Back
     -- * Filtering
   , filter
   , ifilter
-  , mapMaybe
   , takeWhile
   , dropWhile
   , partition
@@ -170,6 +169,16 @@ module Data.PVector.Back
     -- * Stream fusion
   , stream
   , unstream
+
+    -- * Recycling framework (Leshchinskiy 2008)
+  , New(..)
+  , new
+  , clone
+  , fill
+  , updateNew
+  , mapNew
+  , transformNew
+  , inplace_map
 
     -- * Internal (used by Front/Deque)
   , rfoldl'
@@ -661,9 +670,11 @@ update i x v
 {-# INLINE update #-}
 
 -- | Bulk update from a list of (index, value) pairs.
+-- Defined via the recycling framework: @xs // ps = new (updateNew (clone xs) ps)@.
+-- Chained updates like @xs // ps // qs@ will share a single mutable copy.
 (//) :: Vector a -> [(Int, a)] -> Vector a
-(//) v us = modify (\mv -> Prelude.mapM_ (\(i,x) -> mWrite mv i x) us) v
-{-# INLINE (//) #-}
+xs // ps = new (updateNew (clone xs) ps)
+{-# INLINE [1] (//) #-}
 
 adjust :: (a -> a) -> Int -> Vector a -> Vector a
 adjust f i v
@@ -1605,6 +1616,7 @@ mPop mv = do
 -- Stream fusion
 ------------------------------------------------------------------------
 
+-- | Convert a vector to a stream (chunk-aware for efficiency).
 stream :: Vector a -> Stream a
 stream v = Stream step (SInit 0) (Exact n)
   where
@@ -1641,25 +1653,133 @@ data SState a
   | SChunk {-# UNPACK #-} !Int !(SmallArray a) {-# UNPACK #-} !Int
   | STail  {-# UNPACK #-} !Int
 
+-- | Build a vector from a stream. Defined as @new . fill@.
 unstream :: Stream a -> Vector a
-unstream (Stream step s0 _sz) = runST $ do
-  mv <- mNew
-  let go s = case step s of
-        Done       -> unsafeFreeze mv
-        Skip    s' -> go s'
-        Yield a s' -> mPush mv a >> go s'
-  go s0
+unstream = new . fill
 {-# INLINE [0] unstream #-}
 
 ------------------------------------------------------------------------
--- Rewrite rules
+-- Recycling framework (Leshchinskiy, "Recycle Your Arrays!", 2008)
 ------------------------------------------------------------------------
+
+-- | A deferred mutable vector initializer. Wraps a monadic computation
+-- that allocates and populates a mutable vector. The 'New' type is the
+-- key to the recycling optimization: consecutive operations on 'New'
+-- values share a single mutable vector allocation instead of freezing
+-- and re-cloning between each step.
+data New a = New (forall s. ST s (MVector s a))
+
+-- | Materialize a 'New' into a persistent 'Vector' by running the
+-- initializer and freezing the result.
+new :: New a -> Vector a
+new (New mk) = runST (mk >>= unsafeFreeze)
+{-# INLINE [0] new #-}
+
+-- | Initialize a 'New' from a 'Stream'. This is the bridge between
+-- stream fusion and the recycling framework.
+fill :: Stream a -> New a
+fill (Stream step s0 _) = New $ do
+  mv <- mNew
+  let go s = case step s of
+        Done       -> pure mv
+        Skip    s' -> go s'
+        Yield a s' -> mPush mv a >> go s'
+  go s0
+{-# INLINE [0] fill #-}
+
+-- | Create a 'New' by cloning a persistent vector. Defined as
+-- @fill . stream@.
+clone :: Vector a -> New a
+clone = fill . stream
+{-# INLINE [1] clone #-}
+
+-- | Perform a bulk update on a 'New' in-place.
+updateNew :: New a -> [(Int, a)] -> New a
+updateNew (New mk) ps = New $ do
+  mv <- mk
+  Prelude.mapM_ (\(i, x) -> mWrite mv i x) ps
+  pure mv
+{-# INLINE updateNew #-}
+
+-- | Apply a same-type function to every element of a 'New' in-place,
+-- walking the trie structure directly (O(n), no intermediate allocation).
+mapNew :: (a -> a) -> New a -> New a
+mapNew f (New mk) = New $ do
+  mv <- mk
+  mMapInPlace f mv
+  pure mv
+{-# INLINE [0] mapNew #-}
+
+-- | Apply an arbitrary ST action to the mutable vector inside a 'New'.
+transformNew :: (forall s. MVector s a -> ST s ()) -> New a -> New a
+transformNew act (New mk) = New $ do
+  mv <- mk
+  act mv
+  pure mv
+{-# INLINE transformNew #-}
+
+-- | In-place map over a mutable vector. Walks the trie, applying the
+-- function to each leaf element. Frozen (shared) nodes are cloned on
+-- write.
+mMapInPlace :: (a -> a) -> MVector s a -> ST s ()
+mMapInPlace f mv = do
+  st <- getMV mv
+  newRoot <- mMapNodeInPlace f (mvShift st) (mvRoot st)
+  mapMutableArr f (mvTail st) 0 (mvTailSize st)
+  putMV mv st { mvRoot = newRoot }
+{-# INLINE mMapInPlace #-}
+
+-- | Version of 'map' restricted to @(a -> a)@, enabling in-place
+-- execution via the recycling framework.
+inplace_map :: (a -> a) -> Vector a -> Vector a
+inplace_map f = new . mapNew f . clone
+{-# INLINE [1] inplace_map #-}
+
+------------------------------------------------------------------------
+-- Rewrite rules: fusion + recycling
+------------------------------------------------------------------------
+--
+-- The six core rules from the paper:
+--
+--   fusion:    stream (new (fill s))       → s
+--   recycling: fill (stream (new p))       → p
+--   inplace:   fill (smap f (stream (new p))) → mapNew f p   (when a→a)
+--   uninplace: stream (new (mapNew f p))   → smap f (stream (new p))
+--   inplace2:  mapNew f (mapNew g p)       → mapNew (f . g) p
+--   mfusion:   transformNew f (transformNew g p) → transformNew (g >> f) p
+--
+-- Plus stream‐level forwarding for map/filter/fold.
 
 {-# RULES
 
-"pvector/stream/unstream"
-  forall s. stream (unstream s) = s
+-- Core fusion: eliminates stream→new→fill→stream roundtrip
+"pvector/fusion"
+  forall s. stream (new (fill s)) = s
 
+-- Core recycling: eliminates fill→stream→new roundtrip
+"pvector/recycling"
+  forall p. fill (stream (new p)) = p
+
+-- In-place map: eliminate fill when a same-type smap follows clone
+"pvector/inplace/smap" forall f p.
+  fill (S.smap f (stream (new p))) = mapNew f p
+
+-- Uninplace: undo in-place when result is immediately streamed again
+-- (allows subsequent stream fusion to proceed)
+"pvector/uninplace/map" forall f p.
+  stream (new (mapNew f p)) = S.smap f (stream (new p))
+
+-- Compose adjacent in-place maps
+"pvector/mapNew/mapNew" forall f g p.
+  mapNew f (mapNew g p) = mapNew (f . g) p
+
+-- (transformNew composition can't be expressed as a RULE due to rank-2 types;
+-- GHC's inliner handles this case adequately via inlining)
+
+-- Specialise map to inplace_map when the type allows (a -> a)
+"pvector/map/inplace" map = inplace_map
+
+-- Stream-level forwarding for fusion (phase ~1: expose stream form)
 "pvector/map [stream]" [~1]
   forall f v. map f v = unstream (S.smap f (stream v))
 "pvector/filter [stream]" [~1]
@@ -1669,6 +1789,7 @@ unstream (Stream step s0 _sz) = runST $ do
 "pvector/foldr [stream]" [~1]
   forall f z v. foldr f z v = S.sfoldr f z (stream v)
 
+-- Stream-level fallback (phase 1: revert to direct if no fusion)
 "pvector/map [direct]" [1]
   forall f v. unstream (S.smap f (stream v)) = mapDirect f v
 "pvector/filter [direct]" [1]
