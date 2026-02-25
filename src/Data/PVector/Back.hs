@@ -871,28 +871,32 @@ foldl' f z = foldlDirect f z
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
 foldlDirect f z0 v
   | n == 0    = z0
-  | otherwise = finishTail (foldChunksL z0 0)
+  | otherwise = foldArr f (foldNode f z0 (vShift v) (vRoot v)) (vTail v) 0 tailSz
   where
     !n       = vSize v
-    !tailOff = tailOffset n
-    !shift   = vShift v
-    !root    = vRoot v
-    !tail_   = vTail v
-    !tailSz  = sizeofSmallArray tail_
-
-    foldChunksL !z chunkStart
-      | chunkStart >= tailOff = z
-      | otherwise =
-          let !arr = leafFor shift chunkStart root
-              !z'  = foldChunk z arr 0 bf
-          in foldChunksL z' (chunkStart + bf)
-
-    foldChunk !z arr !i !limit
-      | i >= limit = z
-      | otherwise  = foldChunk (f z (indexSmallArray arr i)) arr (i + 1) limit
-
-    finishTail !z = foldChunk z tail_ 0 tailSz
+    !tailSz  = sizeofSmallArray (vTail v)
 {-# INLINE foldlDirect #-}
+
+foldNode :: (b -> a -> b) -> b -> Int -> Node a -> b
+foldNode f = go
+  where
+    go !z !_ Empty = z
+    go !z !_ (Leaf arr) = foldArr f z arr 0 (sizeofSmallArray arr)
+    go !z !level (Internal arr) =
+      let !n = sizeofSmallArray arr
+          goChildren !z' !i
+            | i >= n = z'
+            | otherwise = goChildren (go z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+      in goChildren z 0
+{-# INLINE foldNode #-}
+
+foldArr :: (b -> a -> b) -> b -> SmallArray a -> Int -> Int -> b
+foldArr f = go
+  where
+    go !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  = go (f z (indexSmallArray arr i)) arr (i + 1) limit
+{-# INLINE foldArr #-}
 
 foldl1 :: (a -> a -> a) -> Vector a -> a
 foldl1 f v
@@ -912,25 +916,32 @@ foldr f z = foldrDirect f z
 foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
 foldrDirect f z0 v
   | n == 0    = z0
-  | otherwise = foldrChunks 0 (foldrChunk tail_ 0 tailSz z0)
+  | otherwise = foldrNode f (vShift v) (vRoot v) (foldrArr f (vTail v) 0 tailSz z0)
   where
-    !n       = vSize v
-    !tailOff = tailOffset n
-    !shift   = vShift v
-    !root    = vRoot v
-    !tail_   = vTail v
-    !tailSz  = sizeofSmallArray tail_
-
-    foldrChunks chunkStart tailResult
-      | chunkStart >= tailOff = tailResult
-      | otherwise =
-          let !arr = leafFor shift chunkStart root
-          in foldrChunk arr 0 bf (foldrChunks (chunkStart + bf) tailResult)
-
-    foldrChunk arr !i !limit rest
-      | i >= limit = rest
-      | otherwise  = f (indexSmallArray arr i) (foldrChunk arr (i + 1) limit rest)
+    !n      = vSize v
+    !tailSz = sizeofSmallArray (vTail v)
 {-# INLINE foldrDirect #-}
+
+foldrNode :: (a -> b -> b) -> Int -> Node a -> b -> b
+foldrNode f = go
+  where
+    go !_ Empty rest = rest
+    go !_ (Leaf arr) rest = foldrArr f arr 0 (sizeofSmallArray arr) rest
+    go !level (Internal arr) rest =
+      let !n = sizeofSmallArray arr
+          goChildren !i !r
+            | i < 0     = r
+            | otherwise = goChildren (i - 1) (go (level - bfBits) (indexSmallArray arr i) r)
+      in goChildren (n - 1) rest
+{-# INLINE foldrNode #-}
+
+foldrArr :: (a -> b -> b) -> SmallArray a -> Int -> Int -> b -> b
+foldrArr f arr = go
+  where
+    go !i !limit rest
+      | i >= limit = rest
+      | otherwise  = f (indexSmallArray arr i) (go (i + 1) limit rest)
+{-# INLINE foldrArr #-}
 
 foldr' :: (a -> b -> b) -> b -> Vector a -> b
 foldr' f z0 v = foldl' (\k x -> k . f x) id v z0
@@ -950,28 +961,34 @@ foldr1' f v
 ifoldl' :: (b -> Int -> a -> b) -> b -> Vector a -> b
 ifoldl' f z0 v
   | n == 0    = z0
-  | otherwise = finishTail (ifoldChunksL z0 0)
+  | otherwise =
+      let (!z1, !off1) = ifoldNode f z0 0 (vShift v) (vRoot v)
+      in fst (ifoldArr f z1 off1 (vTail v) 0 tailSz)
   where
-    !n       = vSize v
-    !tailOff = tailOffset n
-    !shift   = vShift v
-    !root    = vRoot v
-    !tail_   = vTail v
-    !tailSz  = sizeofSmallArray tail_
-
-    ifoldChunksL !z chunkStart
-      | chunkStart >= tailOff = z
-      | otherwise =
-          let !arr = leafFor shift chunkStart root
-              !z'  = ifoldChunk z arr chunkStart 0 bf
-          in ifoldChunksL z' (chunkStart + bf)
-
-    ifoldChunk !z arr !base !i !limit
-      | i >= limit = z
-      | otherwise  = ifoldChunk (f z (base + i) (indexSmallArray arr i)) arr base (i + 1) limit
-
-    finishTail !z = ifoldChunk z tail_ tailOff 0 tailSz
+    !n      = vSize v
+    !tailSz = sizeofSmallArray (vTail v)
 {-# INLINE ifoldl' #-}
+
+ifoldNode :: (b -> Int -> a -> b) -> b -> Int -> Int -> Node a -> (b, Int)
+ifoldNode f = go
+  where
+    go !z !off !_ Empty = (z, off)
+    go !z !off !_ (Leaf arr) = ifoldArr f z off arr 0 (sizeofSmallArray arr)
+    go !z !off !level (Internal arr) =
+      let !n = sizeofSmallArray arr
+          goC !z' !off' !i
+            | i >= n = (z', off')
+            | otherwise =
+                let (!z'', !off'') = go z' off' (level - bfBits) (indexSmallArray arr i)
+                in goC z'' off'' (i + 1)
+      in goC z off 0
+
+ifoldArr :: (b -> Int -> a -> b) -> b -> Int -> SmallArray a -> Int -> Int -> (b, Int)
+ifoldArr f = go
+  where
+    go !z !off !arr !i !limit
+      | i >= limit = (z, off)
+      | otherwise  = go (f z off (indexSmallArray arr i)) (off + 1) arr (i + 1) limit
 
 ifoldr :: (Int -> a -> b -> b) -> b -> Vector a -> b
 ifoldr f z0 v
