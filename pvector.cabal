@@ -50,7 +50,8 @@ benchmark bench-pvector
                   , criterion
                   , vector
                   , pvector
-                  , random
+                  , containers
+                  , primitive
   default-language: GHC2021
   ghc-options:      -O2 -rtsopts
 

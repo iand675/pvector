@@ -935,38 +935,37 @@ foldl f z0 v = foldr (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' f z = foldlDirect f z
-{-# NOINLINE [1] foldl' #-}
+foldl' f !z0 v = foldlWithChunks (\z arr n -> foldlArr f z arr 0 n) z0 v
+{-# INLINE foldl' #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
-foldlDirect f z0 v
-  | n == 0    = z0
-  | otherwise = foldArr f (foldNode f z0 (vShift v) (vRoot v)) (vTail v) 0 tailSz
-  where
-    !n       = vSize v
-    !tailSz  = sizeofSmallArray (vTail v)
+foldlDirect = foldl'
 {-# INLINE foldlDirect #-}
 
-foldNode :: (b -> a -> b) -> b -> Int -> Node a -> b
-foldNode f = go
+-- | Strict left fold, iterating a chunk function over all SmallArrays.
+-- The chunk function receives accumulator, array, and element count.
+foldlWithChunks :: (b -> SmallArray a -> Int -> b) -> b -> Vector a -> b
+foldlWithChunks f z0 v
+  | vSize v == 0 = z0
+  | otherwise    = f (goNode z0 (vShift v) (vRoot v)) (vTail v) (sizeofSmallArray (vTail v))
   where
-    go !z !_ Empty = z
-    go !z !_ (Leaf arr) = foldArr f z arr 0 (sizeofSmallArray arr)
-    go !z !level (Internal arr) =
-      let !n = sizeofSmallArray arr
-          goChildren !z' !i
-            | i >= n = z'
-            | otherwise = goChildren (go z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
-      in goChildren z 0
-{-# INLINE foldNode #-}
+    goNode !z !_ Empty = z
+    goNode !z !_ (Leaf arr) = f z arr (sizeofSmallArray arr)
+    goNode !z !level (Internal arr) =
+      let !cn = sizeofSmallArray arr
+          goC !z' !i
+            | i >= cn   = z'
+            | otherwise = goC (goNode z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+      in goC z 0
 
-foldArr :: (b -> a -> b) -> b -> SmallArray a -> Int -> Int -> b
-foldArr f = go
+-- | Strict left fold over a SmallArray range [i, limit).
+foldlArr :: (b -> a -> b) -> b -> SmallArray a -> Int -> Int -> b
+foldlArr f = go
   where
     go !z !arr !i !limit
       | i >= limit = z
       | otherwise  = go (f z (indexSmallArray arr i)) arr (i + 1) limit
-{-# INLINE foldArr #-}
+{-# INLINE foldlArr #-}
 
 foldl1 :: (a -> a -> a) -> Vector a -> a
 foldl1 f v
@@ -983,12 +982,25 @@ foldl1ViaNode :: (a -> a -> a) -> Int -> Node a -> SmallArray a -> a
 foldl1ViaNode f shift root tail_ =
   let (!z, !started) = firstElemNode shift root
   in if started
-     then foldArr f (foldNode f z shift root) tail_ 0 tailSz
+     then goTail (goNode z shift root)
      else case tailSz of
             0 -> error "Data.PVector.Back.foldl1: empty"
-            _ -> foldArr f (indexSmallArray tail_ 0) tail_ 1 tailSz
+            _ -> goTail1 (indexSmallArray tail_ 0)
   where
     !tailSz = sizeofSmallArray tail_
+    goArr !z arr !i !limit
+      | i >= limit = z
+      | otherwise  = goArr (f z (indexSmallArray arr i)) arr (i + 1) limit
+    goNode !z !_ Empty = z
+    goNode !z !_ (Leaf arr) = goArr z arr 0 (sizeofSmallArray arr)
+    goNode !z !level (Internal arr) =
+      let !cn = sizeofSmallArray arr
+          goC !z' !i
+            | i >= cn   = z'
+            | otherwise = goC (goNode z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+      in goC z 0
+    goTail !z = goArr z tail_ 0 tailSz
+    goTail1 !z = goArr z tail_ 1 tailSz
     firstElemNode _ Empty = (error "pvector: no first elem", False)
     firstElemNode _ (Leaf arr)
       | sizeofSmallArray arr > 0 = (indexSmallArray arr 0, True)
@@ -998,31 +1010,29 @@ foldl1ViaNode f shift root tail_ =
       | otherwise = (error "pvector: no first elem", False)
 
 foldr :: (a -> b -> b) -> b -> Vector a -> b
-foldr f z = foldrDirect f z
-{-# NOINLINE [1] foldr #-}
+foldr f z0 v = foldrWithChunks (\arr n rest -> foldrArr f arr 0 n rest) v z0
+{-# INLINE foldr #-}
 
 foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
-foldrDirect f z0 v
-  | n == 0    = z0
-  | otherwise = foldrNode f (vShift v) (vRoot v) (foldrArr f (vTail v) 0 tailSz z0)
-  where
-    !n      = vSize v
-    !tailSz = sizeofSmallArray (vTail v)
+foldrDirect = foldr
 {-# INLINE foldrDirect #-}
 
-foldrNode :: (a -> b -> b) -> Int -> Node a -> b -> b
-foldrNode f = go
+-- | Lazy right fold, calling a chunk function for each SmallArray.
+foldrWithChunks :: (SmallArray a -> Int -> b -> b) -> Vector a -> b -> b
+foldrWithChunks f v z0
+  | vSize v == 0 = z0
+  | otherwise    = goNode (vShift v) (vRoot v) (f (vTail v) (sizeofSmallArray (vTail v)) z0)
   where
-    go !_ Empty rest = rest
-    go !_ (Leaf arr) rest = foldrArr f arr 0 (sizeofSmallArray arr) rest
-    go !level (Internal arr) rest =
-      let !n = sizeofSmallArray arr
-          goChildren !i !r
+    goNode !_ Empty rest = rest
+    goNode !_ (Leaf arr) rest = f arr (sizeofSmallArray arr) rest
+    goNode !level (Internal arr) rest =
+      let !cn = sizeofSmallArray arr
+          goC !i !r
             | i < 0     = r
-            | otherwise = goChildren (i - 1) (go (level - bfBits) (indexSmallArray arr i) r)
-      in goChildren (n - 1) rest
-{-# INLINE foldrNode #-}
+            | otherwise = goC (i - 1) (goNode (level - bfBits) (indexSmallArray arr i) r)
+      in goC (cn - 1) rest
 
+-- | Right fold over SmallArray range [i, limit).
 foldrArr :: (a -> b -> b) -> SmallArray a -> Int -> Int -> b -> b
 foldrArr f arr = go
   where
