@@ -2801,15 +2801,95 @@ liftSmap f (MStream step s0) = MStream step' s0
 -- These have no analogue in the flat-array vector library.
 ------------------------------------------------------------------------
 --
--- == Trie-preserving identity rules ==
+-- == Identity / cancellation rules ==
 --
---   "map id"             map id v = v
---   "reverse/reverse"    reverse (reverse v) = v
---   "fromList/toList"    fromList (toList v) = v
+--   "map id"               map id v = v
+--   "reverse/reverse"      reverse (reverse v) = v
+--   "fromList/toList"      fromList (toList v) = v
+--   "concatMap singleton"  concatMap singleton v = v
 --
---   These avoid O(n) reconstruction when the result is the same
---   vector.  Especially valuable when id/reverse arise from
---   specialisation or inlining (e.g. map id after a type coercion).
+--   These avoid O(n) reconstruction when the result is structurally
+--   identical.  map id commonly arises from specialisation / inlining.
+--
+-- == Structural cancellation (cons/snoc inverses) ==
+--
+--   "head/cons"     head (cons x v)  = x
+--   "last/snoc"     last (snoc v x)  = x
+--   "tail/cons"     tail (cons x v)  = v
+--   "init/snoc"     init (snoc v x)  = v
+--   "uncons/cons"   uncons (cons x v) = Just (x, v)
+--   "unsnoc/snoc"   unsnoc (snoc v x) = Just (v, x)
+--
+--   These are free wins when construction and deconstruction appear
+--   adjacent (common in recursive pipelines and fold/unfold duality).
+--
+-- == Cheap consumers on known-shape vectors ==
+--
+--   "length/map"       length (map f v)     = length v
+--   "length/reverse"   length (reverse v)   = length v
+--   "length/take"      length (take n v)    = min n (length v)
+--   "length/drop"      length (drop n v)    = max 0 (length v - n)
+--   "length/filter"    length (filter p v)  = count p v   (needs a count op)
+--   "length/replicate" length (replicate n x) = max 0 n
+--   "length/snoc"      length (snoc v x)    = length v + 1
+--   "length/cons"      length (cons x v)    = length v + 1
+--   "null/cons"        null (cons x v)      = False
+--   "null/snoc"        null (snoc v x)      = False
+--   "null/singleton"   null (singleton x)   = False
+--   "null/empty"       null empty           = True
+--   "null/map"         null (map f v)       = null v
+--
+--   length is O(1) via vSize — these rules avoid building an
+--   intermediate vector just to read its size field.
+--
+-- == Append identities ==
+--
+--   "empty ++ v"        empty ++ v = v
+--   "v ++ empty"        v ++ empty = v
+--   "singleton ++ v"    singleton x ++ v = cons x v
+--   "v ++ singleton"    v ++ singleton x = snoc v x
+--
+-- == Construction short-circuits ==
+--
+--   "map/replicate"     map f (replicate n x) = replicate n (f x)
+--   "map/singleton"     map f (singleton x)   = singleton (f x)
+--   "map/empty"         map f empty           = empty
+--   "filter/empty"      filter p empty        = empty
+--   "reverse/empty"     reverse empty         = empty
+--   "reverse/singleton" reverse (singleton x) = singleton x
+--   "foldl'/empty"      foldl' f z empty      = z
+--   "foldl'/singleton"  foldl' f z (singleton x) = f z x
+--
+--   These avoid entering the general O(n) path when the structure
+--   is trivially known.  map/replicate is particularly valuable:
+--   it replaces O(n) map + O(n) replicate with a single O(n)
+--   replicate.
+--
+-- == Cross-consumer forwarding ==
+--
+--   "index/map"         index (map f v) i = f (index v i)
+--   "head/map"          head (map f v) = f (head v)
+--   "last/map"          last (map f v) = f (last v)
+--   "all/map"           all p (map f v) = all (p . f) v
+--   "any/map"           any p (map f v) = any (p . f) v
+--   "elem/map"          elem x (map f v) = any (\a -> f a == x) v
+--
+--   These are partially handled by stream consumer forwarding
+--   (head/unstream etc.) but direct rules would fire even when
+--   stream forwarding doesn't apply.
+--
+-- == Take/drop algebra ==
+--
+--   "take/take"         take n (take m v) = take (min n m) v
+--   "drop/drop"         drop n (drop m v) = drop (n + m) v
+--   "take/drop"         take n (drop m v) = slice m n v
+--   "drop/take"         drop n (take m v) = take (max 0 (m-n)) (drop n v)
+--   "take/cons"         take n (cons x v) = cons x (take (n-1) v)  when n > 0
+--   "drop/snoc"         drop n (snoc v x) = snoc (drop n v) x     when n < length v
+--
+--   The stream-level rules (stake/stake, sdrop/sdrop) handle the
+--   fused case.  Direct vector-level rules would apply to standalone
+--   compositions and avoid stream round-trips.
 --
 -- == Tree-sharing take/drop ==
 --
