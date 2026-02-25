@@ -723,16 +723,24 @@ slice i n v
 {-# INLINE slice #-}
 
 init :: Vector a -> Vector a
-init v = case unsnoc v of
+init v = initDirect v
+{-# NOINLINE [1] init #-}
+
+initDirect :: Vector a -> Vector a
+initDirect v = case unsnoc v of
   Nothing    -> error "Data.PVector.Back.init: empty"
   Just (v',_) -> v'
-{-# INLINE init #-}
+{-# INLINE initDirect #-}
 
 tail :: Vector a -> Vector a
-tail v
+tail v = tailDirect v
+{-# NOINLINE [1] tail #-}
+
+tailDirect :: Vector a -> Vector a
+tailDirect v
   | vSize v == 0 = error "Data.PVector.Back.tail: empty"
-  | otherwise     = drop 1 v
-{-# INLINE tail #-}
+  | otherwise     = dropDirect 1 v
+{-# INLINE tailDirect #-}
 
 take :: Int -> Vector a -> Vector a
 take n v = takeDirect n v
@@ -2693,6 +2701,10 @@ liftSmap f (MStream step s0) = MStream step' s0
   dropWhile p v = unstream (S.sdropWhile p (stream v))
 "pvector/zipWith [stream]" [~1] forall f v1 v2.
   zipWith f v1 v2 = unstream (S.szipWith f (stream v1) (stream v2))
+"pvector/init [stream]" [~1] forall v.
+  init v = unstream (S.sinit (stream v))
+"pvector/tail [stream]" [~1] forall v.
+  tail v = unstream (S.stail (stream v))
 "pvector/mapMaybe [stream]" [~1] forall f v.
   mapMaybe f v = unstream (S.smapMaybe f (stream v))
 -- === Consumer fusion: fuse folds when the input is already in stream form ===
@@ -2718,6 +2730,18 @@ liftSmap f (MStream step s0) = MStream step' s0
 "pvector/unsafeIndex/unstream" forall s i.
   unsafeIndex (unstream s) i = S.sindex s i
 
+-- === Slice through unstream: push slicing into the stream ===
+-- When a slice operation is applied to an already-streamed vector,
+-- fold the slice into the stream to avoid materialising then slicing.
+"pvector/take/unstream" forall n s.
+  take n (unstream s) = unstream (S.stake n s)
+"pvector/drop/unstream" forall n s.
+  drop n (unstream s) = unstream (S.sdrop n s)
+"pvector/init/unstream" forall s.
+  init (unstream s) = unstream (S.sinit s)
+"pvector/tail/unstream" forall s.
+  tail (unstream s) = unstream (S.stail s)
+
 -- === General uninplace: expose inplace form for further fusion ===
 "pvector/uninplace" forall (f :: forall m. Monad m => S.MStream m a -> S.MStream m a) g p.
   stream (new (transform f g p)) = S.inplace f g (stream (new p))
@@ -2738,6 +2762,10 @@ liftSmap f (MStream step s0) = MStream step' s0
   unstream (S.sdropWhile p (stream v)) = dropWhileDirect p v
 "pvector/zipWith [direct]" [1] forall f v1 v2.
   unstream (S.szipWith f (stream v1) (stream v2)) = zipWithDirect f v1 v2
+"pvector/init [direct]" [1] forall v.
+  unstream (S.sinit (stream v)) = initDirect v
+"pvector/tail [direct]" [1] forall v.
+  unstream (S.stail (stream v)) = tailDirect v
 "pvector/mapMaybe [direct]" [1] forall f v.
   unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
 

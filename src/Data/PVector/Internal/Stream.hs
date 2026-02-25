@@ -58,6 +58,9 @@ module Data.PVector.Internal.Stream
   , sifilter
   , stake
   , sdrop
+  , sinit
+  , stail
+  , sslice
   , stakeWhile
   , sdropWhile
   , smapMaybe
@@ -336,6 +339,43 @@ sdrop n (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) sz'
           Skip    s' -> Id (Skip (s', i))
           Done       -> Id Done
 {-# INLINE [1] sdrop #-}
+
+sinit :: Bundle a -> Bundle a
+sinit (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, Nothing)) sz'
+  where
+    sz' = case sz of
+      Exact m -> Exact (max 0 (m - 1))
+      Max   m -> Max   (max 0 (m - 1))
+      Unknown -> Unknown
+    step' (s, buf) = case unId (step s) of
+      Yield a s' -> case buf of
+        Nothing -> Id (Skip (s', Just a))
+        Just b  -> Id (Yield b (s', Just a))
+      Skip    s' -> Id (Skip (s', buf))
+      Done       -> Id Done
+{-# INLINE [1] sinit #-}
+
+stail :: Bundle a -> Bundle a
+stail (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, False)) sz'
+  where
+    sz' = case sz of
+      Exact m -> Exact (max 0 (m - 1))
+      Max   m -> Max   (max 0 (m - 1))
+      Unknown -> Unknown
+    step' (s, dropped)
+      | dropped = case unId (step s) of
+          Yield a s' -> Id (Yield a (s', True))
+          Skip    s' -> Id (Skip (s', True))
+          Done       -> Id Done
+      | otherwise = case unId (step s) of
+          Yield _ s' -> Id (Skip (s', True))
+          Skip    s' -> Id (Skip (s', False))
+          Done       -> Id Done
+{-# INLINE [1] stail #-}
+
+sslice :: Int -> Int -> Bundle a -> Bundle a
+sslice i n s = stake n (sdrop i s)
+{-# INLINE sslice #-}
 
 sconcat :: Bundle a -> Bundle a -> Bundle a
 sconcat (Bundle (MStream stepL sL0) szL) (Bundle (MStream stepR sR0) szR) =
