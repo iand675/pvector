@@ -121,6 +121,16 @@ main = defaultMain
       ]
     | n <- sizes
     ]
+  , bgroup "filter (> 0) (keeps all)"
+    [ env (setupAll n) $ \ ~(xs, vec, pvec, sq) ->
+      bgroup (show n)
+      [ bench "[]" $ nf (Prelude.filter (> (0 :: Int))) xs
+      , bench "Vector" $ nf (V.filter (> (0 :: Int))) vec
+      , bench "PVector" $ nf (P.filter (> (0 :: Int))) pvec
+      , bench "Seq" $ nf (Seq.filter (> (0 :: Int))) sq
+      ]
+    | n <- sizes
+    ]
   , bgroup "reverse"
     [ env (setupAll n) $ \ ~(xs, vec, pvec, sq) ->
       bgroup (show n)

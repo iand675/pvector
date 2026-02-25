@@ -128,6 +128,27 @@ backVectorTests = testGroup "Data.PVector.Back"
     [ testCase "filter even" $ do
         let v = V.fromList [1..20 :: Int]
         V.toList (V.filter even v) @?= [2, 4..20]
+    , testCase "filter keeps all (boundary-aligned)" $ do
+        let v = V.fromList [1..1024 :: Int]
+        V.toList (V.filter (> 0) v) @?= [1..1024]
+    , testCase "filter keeps all (non-boundary)" $ do
+        let v = V.fromList [1..100 :: Int]
+        V.toList (V.filter (> 0) v) @?= [1..100]
+    , testCase "filter drops all" $ do
+        let v = V.fromList [1..1024 :: Int]
+        V.toList (V.filter (const False) v) @?= []
+    , testCase "filter single chunk" $ do
+        let v = V.fromList [1..32 :: Int]
+        V.toList (V.filter even v) @?= [2,4..32]
+    , testCase "filter keeps all (single chunk)" $ do
+        let v = V.fromList [1..32 :: Int]
+        V.toList (V.filter (> 0) v) @?= [1..32]
+    , testCase "filter with recovery after drops" $ do
+        let v = V.fromList [1..256 :: Int]
+        V.toList (V.filter (\x -> x > 32) v) @?= [33..256]
+    , testCase "filter large" $ do
+        let v = V.fromList [1..10000 :: Int]
+        V.toList (V.filter even v) @?= Prelude.filter even [1..10000]
     ]
   , testGroup "fold"
     [ testCase "foldl' sum" $ do
@@ -230,6 +251,19 @@ backVectorTests = testGroup "Data.PVector.Back"
         xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
         let v = V.fromList xs
         V.toList (V.filter even v) Hedgehog.=== Prelude.filter even xs
+    , testProperty "filter (const True) == id" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 2000) (Gen.int (Range.linear 0 10000))
+        let v = V.fromList xs
+        V.toList (V.filter (const True) v) Hedgehog.=== xs
+    , testProperty "filter (const False) == empty" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 2000) (Gen.int (Range.linear 0 10000))
+        let v = V.fromList xs
+        V.toList (V.filter (const False) v) Hedgehog.=== []
+    , testProperty "filter (> k) matches list" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 1000) (Gen.int (Range.linear 0 100))
+        k <- Hedgehog.forAll $ Gen.int (Range.linear 0 100)
+        let v = V.fromList xs
+        V.toList (V.filter (> k) v) Hedgehog.=== Prelude.filter (> k) xs
     , testProperty "foldl' (+) 0 == sum" $ Hedgehog.property $ do
         xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 100))
         let v = V.fromList xs
