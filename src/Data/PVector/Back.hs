@@ -1011,15 +1011,12 @@ filterDirect :: forall a. (a -> Bool) -> Vector a -> Vector a
 filterDirect p v
   | vSize v == 0 = empty
   | otherwise = create $ \mv -> do
-      buf <- newSmallArray bf uninitElem
-      (buf', off') <- goNode (vShift v) (vRoot v) buf 0 mv
+      goNode (vShift v) (vRoot v) mv
       let !tailArr = vTail v
           !tailSz = sizeofSmallArray tailArr
-      (buf'', off'') <-
-        if tailSz == bf
-          then goFullChunk tailArr buf' off' mv
-          else filterIntoBuf tailArr 0 tailSz buf' off' mv
-      flushBuf buf'' off'' mv
+      if tailSz == bf
+        then goFullChunk tailArr mv
+        else goFilterChunk tailArr 0 tailSz mv
   where
     allPassChunk :: SmallArray a -> Bool
     allPassChunk !arr = go 0
@@ -1029,44 +1026,39 @@ filterDirect p v
           | p (indexSmallArray arr i) = go (i + 1)
           | otherwise = False
 
-    goNode :: Int -> Node a -> SmallMutableArray s a -> Int -> MVector s a
-           -> ST s (SmallMutableArray s a, Int)
-    goNode !_ Empty !buf !off !_ = pure (buf, off)
-    goNode !_ (Leaf arr) !buf !off !mv = goFullChunk arr buf off mv
-    goNode !level (Internal arr) !buf !off !mv = do
-      let go !b !o !i
-            | i >= bf = pure (b, o)
-            | otherwise = do
-                (b', o') <- goNode (level - bfBits) (indexSmallArray arr i) b o mv
-                go b' o' (i + 1)
-      go buf off 0
+    goNode :: Int -> Node a -> MVector s a -> ST s ()
+    goNode !_ Empty !_ = pure ()
+    goNode !_ (Leaf arr) !mv = goFullChunk arr mv
+    goNode !level (Internal arr) !mv = do
+      let go i | i >= bf   = pure ()
+               | otherwise = do
+                   goNode (level - bfBits) (indexSmallArray arr i) mv
+                   go (i + 1)
+      go 0
 
-    goFullChunk :: SmallArray a -> SmallMutableArray s a -> Int -> MVector s a
-               -> ST s (SmallMutableArray s a, Int)
-    goFullChunk !arr !buf !off !mv
-      | allPassChunk arr =
-          if off == 0
-            then mPushChunk mv arr >> pure (buf, 0)
-            else copyBuffered buf off arr 0 bf mv
-      | otherwise = filterIntoBuf arr 0 bf buf off mv
+    goFullChunk :: SmallArray a -> MVector s a -> ST s ()
+    goFullChunk !arr !mv
+      | allPassChunk arr = do
+          st <- getMV mv
+          if mvTailSize st == 0
+            then mPushChunk mv arr
+            else pushAllChunk arr mv
+      | otherwise = goFilterChunk arr 0 bf mv
 
-    filterIntoBuf :: SmallArray a -> Int -> Int -> SmallMutableArray s a -> Int -> MVector s a
-                  -> ST s (SmallMutableArray s a, Int)
-    filterIntoBuf !arr !i !limit !buf !off !mv
-      | i >= limit = pure (buf, off)
-      | p a = do
-          writeSmallArray buf off a
-          let !off' = off + 1
-          if off' >= bf
-            then do
-              frozen <- unsafeFreezeSmallArray buf
-              mPushChunk mv frozen
-              newBuf <- newSmallArray bf uninitElem
-              filterIntoBuf arr (i + 1) limit newBuf 0 mv
-            else
-              filterIntoBuf arr (i + 1) limit buf off' mv
-      | otherwise = filterIntoBuf arr (i + 1) limit buf off mv
-      where !a = indexSmallArray arr i
+    pushAllChunk :: SmallArray a -> MVector s a -> ST s ()
+    pushAllChunk !arr !mv = go 0
+      where
+        go !i
+          | i >= bf = pure ()
+          | otherwise = mPush mv (indexSmallArray arr i) >> go (i + 1)
+
+    goFilterChunk :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
+    goFilterChunk !arr !i !limit !mv
+      | i >= limit = pure ()
+      | otherwise = do
+          let !a = indexSmallArray arr i
+          when (p a) (mPush mv a)
+          goFilterChunk arr (i + 1) limit mv
 {-# INLINE filterDirect #-}
 
 -- | O(n). Filter with index.

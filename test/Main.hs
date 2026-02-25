@@ -149,6 +149,16 @@ backVectorTests = testGroup "Data.PVector.Back"
     , testCase "filter large" $ do
         let v = V.fromList [1..10000 :: Int]
         V.toList (V.filter even v) @?= Prelude.filter even [1..10000]
+    , testCase "filter even (forced construction)" $ do
+        let v = V.fromList [1..10000 :: Int]
+            !r = V.filter even v
+        V.length r @?= 5000
+        V.toList r @?= Prelude.filter even [1..10000]
+    , testCase "filter keeps all (forced construction)" $ do
+        let v = V.fromList [1..10000 :: Int]
+            !r = V.filter (> 0) v
+        V.length r @?= 10000
+        V.toList r @?= [1..10000]
     ]
   , testGroup "fold"
     [ testCase "foldl' sum" $ do
