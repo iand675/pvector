@@ -608,14 +608,14 @@ take :: Int -> Vector a -> Vector a
 take n v
   | n <= 0        = empty
   | n >= vSize v  = v
-  | otherwise     = unstream . S.inplace (S.stakeM n) (S.smaller (Exact n)) . stream $ v
+  | otherwise     = generate n (unsafeIndex v)
 {-# INLINE take #-}
 
 drop :: Int -> Vector a -> Vector a
 drop n v
   | n <= 0        = v
   | n >= vSize v  = empty
-  | otherwise     = unstream . S.inplace (S.sdropM n) id . stream $ v
+  | otherwise     = generate (vSize v - n) (\i -> unsafeIndex v (i + n))
 {-# INLINE drop #-}
 
 splitAt :: Int -> Vector a -> (Vector a, Vector a)
@@ -698,8 +698,8 @@ adjust' f i v
 -- | O(n). Map a function over all elements.
 -- Participates in stream fusion: @map f . map g@ becomes @map (f . g)@.
 map :: (a -> b) -> Vector a -> Vector b
-map f = unstream . S.inplace (S.smapM f) id . stream
-{-# INLINE map #-}
+map f = mapDirect f
+{-# NOINLINE [1] map #-}
 
 mapDirect :: (a -> b) -> Vector a -> Vector b
 mapDirect f v
@@ -726,9 +726,9 @@ mapNode shift f (Internal arr) = Internal $ runST $ do
   go 0
   unsafeFreezeSmallArray marr
 
--- | O(n). Map with index. Fuses with other stream operations.
+-- | O(n). Map with index.
 imap :: (Int -> a -> b) -> Vector a -> Vector b
-imap f = unstream . S.inplace (S.smapM (Prelude.uncurry f) . S.sindexedM) id . stream
+imap f v = generate (vSize v) (\i -> f i (unsafeIndex v i))
 {-# INLINE imap #-}
 
 concatMap :: (a -> Vector b) -> Vector a -> Vector b
@@ -736,9 +736,11 @@ concatMap f v = create $ \mv ->
   forEach_ v $ \a -> forEach_ (f a) $ \b -> mPush mv b
 {-# INLINE concatMap #-}
 
--- | O(n). Map and collect Just results. Fuses.
 mapMaybe :: (a -> Maybe b) -> Vector a -> Vector b
-mapMaybe f = unstream . S.inplace (S.smapMaybeM f) S.toMax . stream
+mapMaybe f v = create $ \mv ->
+  forEach_ v $ \a -> case f a of
+    Nothing -> pure ()
+    Just b  -> mPush mv b
 {-# INLINE mapMaybe #-}
 
 imapMaybe :: (Int -> a -> Maybe b) -> Vector a -> Vector b
@@ -817,10 +819,9 @@ unzip3 v = (map (\(a,_,_) -> a) v, map (\(_,b,_) -> b) v, map (\(_,_,c) -> c) v)
 ------------------------------------------------------------------------
 
 -- | O(n). Keep only elements satisfying the predicate.
--- Participates in stream fusion: @filter p . filter q@ becomes @filter (\x -> q x && p x)@.
 filter :: (a -> Bool) -> Vector a -> Vector a
-filter f = unstream . S.inplace (S.sfilterM f) S.toMax . stream
-{-# INLINE filter #-}
+filter p = filterDirect p
+{-# NOINLINE [1] filter #-}
 
 filterDirect :: (a -> Bool) -> Vector a -> Vector a
 filterDirect p v
@@ -854,17 +855,20 @@ filterChunk p mv arr = go
 
 -- | O(n). Filter with index.
 ifilter :: (Int -> a -> Bool) -> Vector a -> Vector a
-ifilter f = unstream
-          . S.inplace (S.smapM snd . S.sfilterM (Prelude.uncurry f) . S.sindexedM) S.toMax
-          . stream
+ifilter p v = create $ \mv ->
+  forI_ v $ \i a -> when (p i a) (mPush mv a)
 {-# INLINE ifilter #-}
 
 takeWhile :: (a -> Bool) -> Vector a -> Vector a
-takeWhile f = unstream . S.inplace (S.stakeWhileM f) S.toMax . stream
+takeWhile p v = case findIndex (not . p) v of
+  Nothing -> v
+  Just i  -> take i v
 {-# INLINE takeWhile #-}
 
 dropWhile :: (a -> Bool) -> Vector a -> Vector a
-dropWhile f = unstream . S.inplace (S.sdropWhileM f) S.toMax . stream
+dropWhile p v = case findIndex (not . p) v of
+  Nothing -> empty
+  Just i  -> drop i v
 {-# INLINE dropWhile #-}
 
 partition :: (a -> Bool) -> Vector a -> (Vector a, Vector a)
@@ -1160,29 +1164,37 @@ minimumBy cmp = foldl1' (\x y -> if cmp x y == LT then x else y)
 ------------------------------------------------------------------------
 
 prescanl' :: (a -> b -> a) -> a -> Vector b -> Vector a
-prescanl' f z = unstream . S.inplace (S.sprescanlM' f z) id . stream
+prescanl' f z v = create $ \mv -> do
+  let !n = vSize v
+      go !acc i
+        | i >= n    = pure ()
+        | otherwise = mPush mv acc >> go (f acc (unsafeIndex v i)) (i + 1)
+  go z 0
 {-# INLINE prescanl' #-}
 
 scanl :: (a -> b -> a) -> a -> Vector b -> Vector a
-scanl f z = unstream . S.inplace (S.sscanlM' f z) incSize . stream
-{-# INLINE scanl #-}
+scanl f z v = scanl' f z v
 
 scanl' :: (a -> b -> a) -> a -> Vector b -> Vector a
-scanl' f z = unstream . S.inplace (S.sscanlM' f z) incSize . stream
+scanl' f z v = create $ \mv -> do
+  let !n = vSize v
+      go !acc i
+        | i > n     = pure ()
+        | i == 0    = mPush mv acc >> go acc 1
+        | otherwise = let !acc' = f acc (unsafeIndex v (i - 1))
+                      in mPush mv acc' >> go acc' (i + 1)
+  go z 0
 {-# INLINE scanl' #-}
 
-incSize :: Size -> Size
-incSize (Exact n) = Exact (n Prelude.+ 1)
-incSize (Max n)   = Max (n Prelude.+ 1)
-incSize Unknown   = Unknown
-
 scanl1 :: (a -> a -> a) -> Vector a -> Vector a
-scanl1 f = unstream . S.inplace (S.sscanl1M' f) id . stream
-{-# INLINE scanl1 #-}
+scanl1 f v
+  | vSize v == 0 = empty
+  | otherwise     = scanl f (unsafeIndex v 0) (drop 1 v)
 
 scanl1' :: (a -> a -> a) -> Vector a -> Vector a
-scanl1' f = unstream . S.inplace (S.sscanl1M' f) id . stream
-{-# INLINE scanl1' #-}
+scanl1' f v
+  | vSize v == 0 = empty
+  | otherwise     = scanl' f (unsafeIndex v 0) (drop 1 v)
 
 scanr :: (a -> b -> b) -> b -> Vector a -> Vector b
 scanr f z v = generate (vSize v + 1) step
@@ -1639,7 +1651,7 @@ stream v = Bundle (MStream step (SInit 0)) (Exact n)
     step (STail j)
       | j >= tailSz = Id Done
       | otherwise   = Id (Yield (indexSmallArray tail_ j) (STail (j + 1)))
-{-# INLINE [1] stream #-}
+{-# INLINE [0] stream #-}
 
 data SState a
   = SInit  {-# UNPACK #-} !Int
@@ -1649,7 +1661,7 @@ data SState a
 -- | Build a vector from a 'Bundle'. Defined as @new . fill@.
 unstream :: Bundle a -> Vector a
 unstream = new . fill
-{-# INLINE [1] unstream #-}
+{-# INLINE [0] unstream #-}
 
 ------------------------------------------------------------------------
 -- Recycling framework (Leshchinskiy, "Recycle Your Arrays!", 2008)
@@ -1666,7 +1678,7 @@ data New a = New (forall s. ST s (MVector s a))
 -- initializer and freezing the result.
 new :: New a -> Vector a
 new (New mk) = runST (mk >>= unsafeFreeze)
-{-# INLINE [1] new #-}
+{-# INLINE [0] new #-}
 
 -- | Initialize a 'New' from a 'Bundle'. This is the bridge between
 -- stream fusion and the recycling framework.
@@ -1835,11 +1847,24 @@ liftSmap f (MStream step s0) = MStream step' s0
 -- Specialise map to inplace_map when the type allows (a -> a)
 "pvector/map/inplace" map = inplace_map
 
--- === Fold consumers: skip vector construction when consuming ===
+-- === Stream forwarding: expose stream form for cross-operation fusion ===
+"pvector/map [stream]" [~1] forall f v.
+  map f v = unstream (S.smap f (stream v))
+"pvector/filter [stream]" [~1] forall f v.
+  filter f v = unstream (S.sfilter f (stream v))
+"pvector/foldl' [stream]" [~1] forall f z v.
+  foldl' f z v = S.sfoldl' f z (stream v)
+"pvector/foldr [stream]" [~1] forall f z v.
+  foldr f z v = S.sfoldr f z (stream v)
 
-"pvector/foldl'/stream" forall f z v.
+-- === Fallback rules: revert to direct implementations when not fused ===
+"pvector/map [direct]" [1] forall f v.
+  unstream (S.smap f (stream v)) = mapDirect f v
+"pvector/filter [direct]" [1] forall f v.
+  unstream (S.sfilter f (stream v)) = filterDirect f v
+"pvector/foldl' [direct]" [1] forall f z v.
   S.sfoldl' f z (stream v) = foldlDirect f z v
-"pvector/foldr/stream" forall f z v.
+"pvector/foldr [direct]" [1] forall f z v.
   S.sfoldr f z (stream v) = foldrDirect f z v
 
   #-}

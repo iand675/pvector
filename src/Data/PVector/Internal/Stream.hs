@@ -174,7 +174,7 @@ data Bundle a = Bundle
 -- size.  Semantically, @inplace f g b = fromStream (f (sElems b)) (g (sSize b))@.
 inplace :: (forall m. Monad m => MStream m a -> MStream m b)
         -> (Size -> Size) -> Bundle a -> Bundle b
-{-# INLINE [1] inplace #-}
+{-# INLINE [0] inplace #-}
 inplace f g (Bundle s sz) = Bundle (f s) (g sz)
 
 -- | Extract the size.
@@ -269,7 +269,7 @@ smap f (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) sz
       Yield a s' -> Id (Yield (f a) s')
       Skip    s' -> Id (Skip s')
       Done       -> Id Done
-{-# INLINE [1] smap #-}
+{-# INLINE [0] smap #-}
 
 simap :: (Int -> a -> b) -> Bundle a -> Bundle b
 simap f (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) sz
@@ -288,7 +288,7 @@ sfilter p (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) (toMax sz)
                  | otherwise -> Id (Skip s')
       Skip    s'             -> Id (Skip s')
       Done                   -> Id Done
-{-# INLINE [1] sfilter #-}
+{-# INLINE [0] sfilter #-}
 
 sifilter :: (Int -> a -> Bool) -> Bundle a -> Bundle a
 sifilter p (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) (toMax sz)
