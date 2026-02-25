@@ -164,7 +164,13 @@ module Data.PVector.Back
   , mRead
   , mWrite
   , mPush
+  , mPushChunk
   , mPop
+
+    -- * Fast bulk construction
+  , fromListN
+  , generateN
+  , unsafeFromChunks
 
     -- * Stream fusion
   , stream
@@ -397,20 +403,22 @@ singleton x = Vector 1 bfBits emptyRoot tail_
       unsafeFreezeSmallArray a
 {-# INLINE singleton #-}
 
+-- | O(n). Build a vector from a list.
 fromList :: [a] -> Vector a
 fromList xs = create $ \mv ->
   let go []     = pure ()
       go (a:as) = mPush mv a >> go as
   in go xs
-{-# INLINE [1] fromList #-}
 
+-- | O(n). Build a vector from the first @n@ elements of a list.
 fromListN :: Int -> [a] -> Vector a
-fromListN n xs = create $ \mv ->
-  let go _ []     = pure ()
-      go 0 _      = pure ()
-      go i (a:as) = mPush mv a >> go (i - 1) as
-  in go n xs
-{-# INLINE [1] fromListN #-}
+fromListN n xs
+  | n <= 0    = empty
+  | otherwise = create $ \mv ->
+      let go _ []     = pure ()
+          go 0 _      = pure ()
+          go i (a:as) = mPush mv a >> go (i - 1) as
+      in go n xs
 
 replicate :: Int -> a -> Vector a
 replicate n x
@@ -421,6 +429,22 @@ replicate n x
       in go n
 {-# INLINE replicate #-}
 
+-- | O(n). Build a vector from a list of full 32-element SmallArrays
+-- plus a partial tail.  Each chunk MUST have exactly 32 elements.
+-- The tail can have 0-31 elements.  This is the fastest way to
+-- construct a vector when you have pre-built chunks.
+unsafeFromChunks :: [SmallArray a] -> SmallArray a -> Vector a
+unsafeFromChunks chunks tail_ = create $ \mv -> do
+  let go [] = pure ()
+      go (c:cs) = mPushChunk mv c >> go cs
+  go chunks
+  let !ts = sizeofSmallArray tail_
+      goTail !i
+        | i >= ts   = pure ()
+        | otherwise = mPush mv (indexSmallArray tail_ i) >> goTail (i + 1)
+  goTail 0
+{-# INLINE unsafeFromChunks #-}
+
 generate :: Int -> (Int -> a) -> Vector a
 generate n f
   | n <= 0    = empty
@@ -429,6 +453,11 @@ generate n f
                | otherwise = mPush mv (f i) >> go (i + 1)
       in go 0
 {-# INLINE generate #-}
+
+-- | O(n). Same as 'generate'.
+generateN :: Int -> (Int -> a) -> Vector a
+generateN = generate
+{-# INLINE generateN #-}
 
 iterateN :: Int -> (a -> a) -> a -> Vector a
 iterateN n f x0
@@ -711,7 +740,7 @@ mapDirect f v
 
 mapNode :: Int -> (a -> b) -> Node a -> Node b
 mapNode _ _ Empty = Empty
-mapNode _ f (Leaf arr) = Leaf (mapArray' f arr)
+mapNode _ f (Leaf arr) = Leaf (mapChunk32 f arr)
 mapNode shift f (Internal arr) = Internal $ runST $ do
   marr <- newSmallArray bf Empty
   let !n = bf
@@ -933,7 +962,11 @@ foldl f z0 v = foldr (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' f !z0 v = foldlWithChunks (\z arr n -> foldlArr f z arr 0 n) z0 v
+foldl' f !z0 v = foldlWithChunks foldChunk z0 v
+  where
+    foldChunk z arr n
+      | n == bf   = foldlChunk32 f z arr
+      | otherwise = foldlArr f z arr 0 n
 {-# INLINE foldl' #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
@@ -1007,7 +1040,11 @@ foldl1ViaNode f shift root tail_ =
       | otherwise = (error "pvector: no first elem", False)
 
 foldr :: (a -> b -> b) -> b -> Vector a -> b
-foldr f z0 v = foldrWithChunks (\arr n rest -> foldrArr f arr 0 n rest) v z0
+foldr f z0 v = foldrWithChunks foldChunk v z0
+  where
+    foldChunk arr n rest
+      | n == bf   = foldrChunk32 f arr rest
+      | otherwise = foldrArr f arr 0 n rest
 {-# INLINE foldr #-}
 
 foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
@@ -1570,6 +1607,38 @@ mPush mv x = do
   where
     undefinedElem' = error "pvector: uninitialised element"
 {-# INLINE mPush #-}
+
+-- | Push a full 32-element SmallArray directly as a new leaf chunk.
+-- The current tail MUST be empty (tailSize == 0).  This is much faster
+-- than pushing elements one at a time because it skips per-element
+-- tail filling entirely.  Call only when the tail has just been
+-- flushed (size is a multiple of 32) or on a fresh mutable vector.
+-- | Push a full 32-element SmallArray as a new leaf, bypassing
+-- per-element tail filling.  Tail MUST be empty (tailSize == 0).
+mPushChunk :: PrimMonad m => MVector (PrimState m) a -> SmallArray a -> m ()
+mPushChunk mv chunk = do
+  st <- getMV mv
+  let !n  = mvSize st
+      !n' = n + bf
+      -- mPushTail navigates using (size-1), and n' is the size AFTER adding.
+      -- So (n'-1) = (n+31) gives the index of the last element in this chunk.
+      !willOverflow = unsafeShiftR n' bfBits > unsafeShiftL 1 (mvShift st)
+  (newRoot, newShift) <-
+    if willOverflow
+      then do
+        arr <- newSmallArray bf (Frozen Empty)
+        writeSmallArray arr 0 (mvRoot st)
+        let !path = thawNode (newPath (mvShift st) (Leaf chunk))
+        writeSmallArray arr 1 path
+        pure (MInternal arr, mvShift st + bfBits)
+      else do
+        r <- mPushTail n' (mvShift st) (mvRoot st) chunk
+        pure (r, mvShift st)
+  newTail <- newSmallArray bf undefinedElem'
+  putMV mv $! MVState n' newShift newRoot newTail 0
+  where
+    undefinedElem' = error "pvector: uninitialised element"
+{-# INLINE mPushChunk #-}
 
 mPushTail
   :: PrimMonad m

@@ -24,6 +24,11 @@ module Data.PVector.Internal
   , mMapNodeInPlace
   , mapMutableArr
 
+    -- * Unrolled chunk operations
+  , foldlChunk32
+  , foldrChunk32
+  , mapChunk32
+
     -- * Array helpers
   , emptyRoot
   , emptyTail
@@ -98,11 +103,9 @@ freezeNode :: PrimMonad m => MNode (PrimState m) a -> m (Node a)
 freezeNode (Frozen node) = pure node
 freezeNode (MLeaf marr)  = Leaf <$> unsafeFreezeSmallArray marr
 freezeNode (MInternal marr) = do
-  n <- getSizeofSmallMutableArray marr
-  let _ = n
-  buf <- newSmallArray n Empty
+  buf <- newSmallArray bf Empty
   let go i
-        | i >= n    = pure ()
+        | i >= bf   = pure ()
         | otherwise = do
             child <- readSmallArray marr i
             p <- freezeNode child
@@ -135,7 +138,7 @@ editableLeaf
   => MNode (PrimState m) a
   -> m (SmallMutableArray (PrimState m) a)
 editableLeaf (MLeaf arr) = pure arr
-editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 (sizeofSmallArray arr)
+editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 bf
 editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 {-# INLINABLE editableLeaf #-}
 
@@ -143,8 +146,6 @@ editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 -- In-place mutable trie operations
 ------------------------------------------------------------------------
 
--- | Apply a function to every element of a mutable trie node in-place.
--- Frozen nodes are cloned-on-write. Returns the (possibly new) node.
 mMapNodeInPlace :: PrimMonad m => (a -> a) -> Int -> MNode (PrimState m) a -> m (MNode (PrimState m) a)
 mMapNodeInPlace _ _ n@(Frozen Empty) = pure n
 mMapNodeInPlace f _ (MLeaf arr) = do
@@ -176,7 +177,6 @@ mMapNodeInPlace f shift (Frozen (Internal arr)) = do
   pure (MInternal marr)
 {-# INLINABLE mMapNodeInPlace #-}
 
--- | Apply a function to elements [i..n) of a mutable array in-place.
 mapMutableArr :: PrimMonad m => (a -> a) -> SmallMutableArray (PrimState m) a -> Int -> Int -> m ()
 mapMutableArr f arr = go
   where
@@ -187,6 +187,56 @@ mapMutableArr f arr = go
           writeSmallArray arr i (f x)
           go (i + 1) n
 {-# INLINE mapMutableArr #-}
+
+------------------------------------------------------------------------
+-- Unrolled chunk operations
+------------------------------------------------------------------------
+
+-- | Strict left fold over a full 32-element SmallArray.
+-- Uses manual 4x unrolling so GHC generates a tight loop
+-- without per-element bounds checks.
+foldlChunk32 :: (b -> a -> b) -> b -> SmallArray a -> b
+foldlChunk32 f !z0 arr = go z0 0
+  where
+    go !z !i
+      | i >= 32   = z
+      | i + 3 < 32 =
+          let !z1 = f z  (indexSmallArray arr i)
+              !z2 = f z1 (indexSmallArray arr (i+1))
+              !z3 = f z2 (indexSmallArray arr (i+2))
+              !z4 = f z3 (indexSmallArray arr (i+3))
+          in go z4 (i + 4)
+      | otherwise =
+          go (f z (indexSmallArray arr i)) (i + 1)
+{-# INLINE foldlChunk32 #-}
+
+-- | Right fold over a full 32-element SmallArray.
+foldrChunk32 :: (a -> b -> b) -> SmallArray a -> b -> b
+foldrChunk32 f arr z0 = go 0
+  where
+    go !i
+      | i >= 32   = z0
+      | otherwise = f (indexSmallArray arr i) (go (i + 1))
+{-# INLINE foldrChunk32 #-}
+
+-- | Strict map over a full 32-element SmallArray.
+mapChunk32 :: (a -> b) -> SmallArray a -> SmallArray b
+mapChunk32 f arr = runST $ do
+  marr <- newSmallArray 32 undefinedElem
+  let go !i
+        | i >= 32 = pure ()
+        | i + 3 < 32 = do
+            writeSmallArray marr i     $! f (indexSmallArray arr i)
+            writeSmallArray marr (i+1) $! f (indexSmallArray arr (i+1))
+            writeSmallArray marr (i+2) $! f (indexSmallArray arr (i+2))
+            writeSmallArray marr (i+3) $! f (indexSmallArray arr (i+3))
+            go (i + 4)
+        | otherwise = do
+            writeSmallArray marr i $! f (indexSmallArray arr i)
+            go (i + 1)
+  go 0
+  unsafeFreezeSmallArray marr
+{-# INLINE mapChunk32 #-}
 
 ------------------------------------------------------------------------
 -- Array helpers
@@ -233,7 +283,6 @@ cloneAndSet arr i x = runST $ do
   unsafeFreezeSmallArray marr
 {-# INLINE cloneAndSet #-}
 
--- | Strict map over a SmallArray, producing a new array.
 mapArray' :: (a -> b) -> SmallArray a -> SmallArray b
 mapArray' f arr = runST $ do
   let !n = sizeofSmallArray arr
