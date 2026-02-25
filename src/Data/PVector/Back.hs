@@ -2771,6 +2771,44 @@ liftSmap f (MStream step s0) = MStream step' s0
 
   #-}
 
+-- TODO: Vector-library rules not yet ported. These may be worth adopting
+-- if the corresponding features are added to pvector.
+--
+-- == Reverse streaming (requires streamR/unstreamR infrastructure) ==
+--   "streamR/unstreamR"              streamR (new (unstreamR s)) = s
+--   "unstreamR/streamR/new"          unstreamR (streamR (new p)) = p
+--   "unstream/streamR/new"           unstream (streamR (new p)) = modify reverse p
+--   "unstreamR/stream/new"           unstreamR (stream (new p)) = modify reverse p
+--   "inplace right"                  unstreamR (inplace f g (streamR (new m))) = transformR f g m
+--   "uninplace right"                streamR (new (transformR f g m)) = inplace f g (streamR (new m))
+--   "transformR/transformR [New]"    compose reverse transforms
+--   "transformR/unstreamR [New]"     fold reverse transform into bundle
+--
+-- == Monadic consumer forwarding (requires indexM/headM/lastM support) ==
+--   "indexM/unstream"                indexM (new (fill s)) i = sindex s i  (in a monad)
+--   "headM/unstream"                headM (new (fill s)) = shead s  (in a monad)
+--   "lastM/unstream"                lastM (new (fill s)) = slast s  (in a monad)
+--   "unsafeIndexM/unstream"         ditto, unsafe variant
+--   "unsafeHeadM/unstream"          ditto
+--   "unsafeLastM/unstream"          ditto
+--
+-- == Self-zip optimisation ==
+--   "szipWith xs xs"                szipWith f s s = smap (\x -> f x x) s
+--   Turns a self-zip into a map. Requires detecting that both bundle
+--   arguments are the same (via 'lift' in vector; pvector would need
+--   an equivalent tagging mechanism).
+--
+-- == enumFromTo specialisations (requires Enum-based construction API) ==
+--   "enumFromTo<Int>"               use tight Int loop
+--   "enumFromTo<Word>"              use tight Word loop
+--   "enumFromTo<Char>"              use tight Char loop
+--   "enumFromTo<Double>"            use floating-point loop
+--   ... and ~12 more for Int8/16/32/64, Word8/16/32/64, Float, Integer
+--
+-- == unstablePartition ==
+--   "unstablePartition"             fuse partition with stream to avoid
+--                                   materialising intermediate vector
+
 ------------------------------------------------------------------------
 -- Internal tree operations
 ------------------------------------------------------------------------

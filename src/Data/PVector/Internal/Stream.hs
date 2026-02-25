@@ -725,3 +725,18 @@ sscanl1M' f (MStream step s0) = MStream step' (s0, Nothing)
          g1 g2 s.
   inplace f1 g1 (inplace f2 g2 s) = inplace (f1 . f2) (g1 . g2) s
   #-}
+
+-- TODO: Additional stream-level rules from the vector library that
+-- may be worth adding:
+--
+-- == Filter/take/drop interactions (beyond what we have) ==
+--   "sdrop/sfilter"    sdrop n (sfilter p s) = sfilter p (sdrop n s)
+--   "sinit/smap"       sinit (smap f s) = smap f (sinit s)
+--   "stail/smap"       stail (smap f s) = smap f (stail s)
+--
+-- == Concat/flatmap fusion ==
+--   "sconcat/smap"     sconcat (smap f s1) (smap f s2) = smap f (sconcat s1 s2)
+--
+-- == enumFromStepN specialisations ==
+--   Type-specialised enumFromStepN for Int, Word, etc. to avoid
+--   Num dictionary overhead in tight loops.
