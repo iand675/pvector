@@ -68,6 +68,20 @@ module Data.PVector.Internal.Stream
   , slength
   , snull
   , stoList
+
+    -- * Monadic stream combinators (for inplace)
+  , smapM
+  , sfilterM
+  , smapMaybeM
+  , stakeWhileM
+  , sdropWhileM
+  , sindexedM
+  , stakeM
+  , sdropM
+  , sprescanlM'
+  , spostscanlM'
+  , sscanlM'
+  , sscanl1M'
   ) where
 
 import Prelude hiding (replicate)
@@ -391,6 +405,156 @@ snull (Bundle (MStream step s0) _) = go s0
 stoList :: Bundle a -> [a]
 stoList = sfoldr (:) []
 {-# INLINE stoList #-}
+
+------------------------------------------------------------------------
+-- Monadic stream combinators (polymorphic in m, needed for inplace)
+------------------------------------------------------------------------
+
+smapM :: Monad m => (a -> b) -> MStream m a -> MStream m b
+smapM f (MStream step s0) = MStream step' s0
+  where
+    step' s = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> Yield (f x) s'
+        Skip    s' -> Skip s'
+        Done       -> Done
+{-# INLINE [0] smapM #-}
+
+sfilterM :: Monad m => (a -> Bool) -> MStream m a -> MStream m a
+sfilterM p (MStream step s0) = MStream step' s0
+  where
+    step' s = do
+      r <- step s
+      pure $ case r of
+        Yield x s' | p x       -> Yield x s'
+                   | otherwise -> Skip s'
+        Skip    s'             -> Skip s'
+        Done                   -> Done
+{-# INLINE [0] sfilterM #-}
+
+smapMaybeM :: Monad m => (a -> Maybe b) -> MStream m a -> MStream m b
+smapMaybeM f (MStream step s0) = MStream step' s0
+  where
+    step' s = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> case f x of
+          Just y  -> Yield y s'
+          Nothing -> Skip s'
+        Skip    s' -> Skip s'
+        Done       -> Done
+{-# INLINE [0] smapMaybeM #-}
+
+stakeWhileM :: Monad m => (a -> Bool) -> MStream m a -> MStream m a
+stakeWhileM p (MStream step s0) = MStream step' s0
+  where
+    step' s = do
+      r <- step s
+      pure $ case r of
+        Yield x s' | p x       -> Yield x s'
+                   | otherwise -> Done
+        Skip    s'             -> Skip s'
+        Done                   -> Done
+{-# INLINE [0] stakeWhileM #-}
+
+sdropWhileM :: Monad m => (a -> Bool) -> MStream m a -> MStream m a
+sdropWhileM p (MStream step s0) = MStream step' (s0, True)
+  where
+    step' (s, dropping) = do
+      r <- step s
+      pure $ case r of
+        Yield x s'
+          | dropping && p x -> Skip (s', True)
+          | otherwise       -> Yield x (s', False)
+        Skip    s'          -> Skip (s', dropping)
+        Done                -> Done
+{-# INLINE [0] sdropWhileM #-}
+
+sindexedM :: Monad m => MStream m a -> MStream m (Int, a)
+sindexedM (MStream step s0) = MStream step' (s0, 0)
+  where
+    step' (s, !i) = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> Yield (i, x) (s', i + 1)
+        Skip    s' -> Skip (s', i)
+        Done       -> Done
+{-# INLINE [0] sindexedM #-}
+
+stakeM :: Monad m => Int -> MStream m a -> MStream m a
+stakeM n (MStream step s0) = MStream step' (s0, 0)
+  where
+    step' (s, i)
+      | i >= n = pure Done
+      | otherwise = do
+          r <- step s
+          pure $ case r of
+            Yield x s' -> Yield x (s', i + 1)
+            Skip    s' -> Skip (s', i)
+            Done       -> Done
+{-# INLINE [0] stakeM #-}
+
+sdropM :: Monad m => Int -> MStream m a -> MStream m a
+sdropM n (MStream step s0) = MStream step' (s0, 0)
+  where
+    step' (s, i) = do
+      r <- step s
+      pure $ case r of
+        Yield x s'
+          | i < n     -> Skip (s', i + 1)
+          | otherwise -> Yield x (s', i + 1)
+        Skip    s'    -> Skip (s', i)
+        Done          -> Done
+{-# INLINE [0] sdropM #-}
+
+sprescanlM' :: Monad m => (a -> b -> a) -> a -> MStream m b -> MStream m a
+sprescanlM' f z0 (MStream step s0) = MStream step' (s0, z0)
+  where
+    step' (s, !z) = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> Yield z (s', f z x)
+        Skip    s' -> Skip (s', z)
+        Done       -> Done
+{-# INLINE [0] sprescanlM' #-}
+
+spostscanlM' :: Monad m => (a -> b -> a) -> a -> MStream m b -> MStream m a
+spostscanlM' f z0 (MStream step s0) = MStream step' (s0, z0)
+  where
+    step' (s, !z) = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> let !z' = f z x in Yield z' (s', z')
+        Skip    s' -> Skip (s', z)
+        Done       -> Done
+{-# INLINE [0] spostscanlM' #-}
+
+sscanlM' :: Monad m => (a -> b -> a) -> a -> MStream m b -> MStream m a
+sscanlM' f z0 (MStream step s0) = MStream step' (s0, z0, True)
+  where
+    step' (s, !z, first_)
+      | first_    = pure (Yield z (s, z, False))
+      | otherwise = do
+          r <- step s
+          pure $ case r of
+            Yield x s' -> let !z' = f z x in Yield z' (s', z', False)
+            Skip    s' -> Skip (s', z, False)
+            Done       -> Done
+{-# INLINE [0] sscanlM' #-}
+
+sscanl1M' :: Monad m => (a -> a -> a) -> MStream m a -> MStream m a
+sscanl1M' f (MStream step s0) = MStream step' (s0, Nothing)
+  where
+    step' (s, macc) = do
+      r <- step s
+      pure $ case r of
+        Yield x s' -> case macc of
+          Nothing -> Yield x (s', Just x)
+          Just !z -> let !z' = f z x in Yield z' (s', Just z')
+        Skip    s' -> Skip (s', macc)
+        Done       -> Done
+{-# INLINE [0] sscanl1M' #-}
 
 ------------------------------------------------------------------------
 -- Rewrite rules for stream-stream fusion
