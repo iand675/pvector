@@ -1596,22 +1596,55 @@ reverse :: Vector a -> Vector a
 reverse v
   | n <= 1    = v
   | otherwise = create $ \mv -> do
-      pushRevArr (vTail v) (sizeofSmallArray (vTail v) - 1) mv
-      revNode (vShift v) (vRoot v) mv
+      buf <- newSmallArray bf uninitElem
+      let !tail_ = vTail v
+          !tailSz = sizeofSmallArray tail_
+      copyReversedArr buf 0 tail_ (tailSz - 1) tailSz
+      (buf', off') <- revNodeBuffered buf tailSz (vShift v) (vRoot v) mv
+      flushBuf buf' off' mv
   where
     !n = vSize v
 
-    pushRevArr !arr !i !mv
-      | i < 0     = pure ()
-      | otherwise = mPush mv (indexSmallArray arr i) >> pushRevArr arr (i - 1) mv
+    copyReversedArr !dst !dstOff !src !srcIdx !count = do
+      let go !di !si !c
+            | c <= 0    = pure ()
+            | otherwise = do
+                writeSmallArray dst di (indexSmallArray src si)
+                go (di + 1) (si - 1) (c - 1)
+      go dstOff srcIdx count
 
-    revNode !_ Empty !_ = pure ()
-    revNode !_ (Leaf arr) !mv = pushRevArr arr (bf - 1) mv
-    revNode !level (Internal arr) !mv = do
-      let go !i
-            | i < 0     = pure ()
-            | otherwise = revNode (level - bfBits) (indexSmallArray arr i) mv >> go (i - 1)
-      go (bf - 1)
+    revNodeBuffered !buf !off !_ Empty !_ = pure (buf, off)
+    revNodeBuffered !buf !off !_ (Leaf arr) !mv
+      | off == 0 = do
+          revArr <- reverseSmallArr arr bf
+          mPushChunk mv revArr
+          pure (buf, 0)
+      | otherwise = do
+          let !avail = bf - off
+          copyReversedArr buf off arr (bf - 1) avail
+          frozen <- unsafeFreezeSmallArray buf
+          mPushChunk mv frozen
+          newBuf <- newSmallArray bf uninitElem
+          let !remaining = off
+          copyReversedArr newBuf 0 arr (off - 1) remaining
+          pure (newBuf, remaining)
+    revNodeBuffered !buf !off !level (Internal arr) !mv = do
+      let go !b !o !i
+            | i < 0     = pure (b, o)
+            | otherwise = do
+                (b', o') <- revNodeBuffered b o (level - bfBits) (indexSmallArray arr i) mv
+                go b' o' (i - 1)
+      go buf off (bf - 1)
+
+    reverseSmallArr !src !len = do
+      marr <- newSmallArray len uninitElem
+      let go !i !j
+            | i >= len  = pure ()
+            | otherwise = do
+                writeSmallArray marr i (indexSmallArray src j)
+                go (i + 1) (j - 1)
+      go 0 (len - 1)
+      unsafeFreezeSmallArray marr
 {-# INLINE reverse #-}
 
 ------------------------------------------------------------------------
