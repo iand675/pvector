@@ -352,7 +352,7 @@ instance F.Foldable Vector where
   {-# INLINE toList #-}
 
 instance Traversable Vector where
-  traverse f v = foldl' (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) v
+  traverse f v = foldlDirect (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) v
   {-# INLINE traverse #-}
 
 instance Exts.IsList (Vector a) where
@@ -735,18 +735,26 @@ tail v
 {-# INLINE tail #-}
 
 take :: Int -> Vector a -> Vector a
-take n v
+take n v = takeDirect n v
+{-# NOINLINE [1] take #-}
+
+takeDirect :: Int -> Vector a -> Vector a
+takeDirect n v
   | n <= 0        = empty
   | n >= vSize v  = v
   | otherwise     = generate n (unsafeIndex v)
-{-# INLINE take #-}
+{-# INLINE takeDirect #-}
 
 drop :: Int -> Vector a -> Vector a
-drop n v
+drop n v = dropDirect n v
+{-# NOINLINE [1] drop #-}
+
+dropDirect :: Int -> Vector a -> Vector a
+dropDirect n v
   | n <= 0        = v
   | n >= vSize v  = empty
   | otherwise     = generate (vSize v - n) (\i -> unsafeIndex v (i + n))
-{-# INLINE drop #-}
+{-# INLINE dropDirect #-}
 
 splitAt :: Int -> Vector a -> (Vector a, Vector a)
 splitAt n v = (take n v, drop n v)
@@ -905,11 +913,15 @@ concatMap f v = create $ \mv ->
 {-# INLINE concatMap #-}
 
 mapMaybe :: (a -> Maybe b) -> Vector a -> Vector b
-mapMaybe f v = create $ \mv ->
+mapMaybe f v = mapMaybeDirect f v
+{-# NOINLINE [1] mapMaybe #-}
+
+mapMaybeDirect :: (a -> Maybe b) -> Vector a -> Vector b
+mapMaybeDirect f v = create $ \mv ->
   forEach_ v $ \a -> case f a of
     Nothing -> pure ()
     Just b  -> mPush mv b
-{-# INLINE mapMaybe #-}
+{-# INLINE mapMaybeDirect #-}
 
 imapMaybe :: (Int -> a -> Maybe b) -> Vector a -> Vector b
 imapMaybe f v = create $ \mv ->
@@ -923,11 +935,11 @@ imapMaybe f v = create $ \mv ->
 ------------------------------------------------------------------------
 
 mapM :: Monad m => (a -> m b) -> Vector a -> m (Vector b)
-mapM f v = foldl' (\acc a -> acc >>= \v' -> f a >>= \b -> pure (snoc v' b)) (pure empty) v
+mapM f v = foldlDirect (\acc a -> acc >>= \v' -> f a >>= \b -> pure (snoc v' b)) (pure empty) v
 {-# INLINE mapM #-}
 
 mapM_ :: Monad m => (a -> m b) -> Vector a -> m ()
-mapM_ f = foldl' (\m a -> m >> f a >> pure ()) (pure ())
+mapM_ f = foldlDirect (\m a -> m >> f a >> pure ()) (pure ())
 {-# INLINE mapM_ #-}
 
 forM :: Monad m => Vector a -> (a -> m b) -> m (Vector b)
@@ -939,11 +951,11 @@ forM_ = flip mapM_
 {-# INLINE forM_ #-}
 
 imapM :: Monad m => (Int -> a -> m b) -> Vector a -> m (Vector b)
-imapM f v = ifoldl' (\acc i a -> acc >>= \v' -> f i a >>= \b -> pure (snoc v' b)) (pure empty) v
+imapM f v = ifoldl' (\acc i a -> acc >>= \v' -> f i a >>= \b -> pure (snoc v' b)) (Prelude.pure empty) v
 {-# INLINE imapM #-}
 
 imapM_ :: Monad m => (Int -> a -> m ()) -> Vector a -> m ()
-imapM_ f = ifoldl' (\m i a -> m >> f i a) (pure ())
+imapM_ f = ifoldl' (\m i a -> m >> f i a) (Prelude.pure ())
 {-# INLINE imapM_ #-}
 
 ------------------------------------------------------------------------
@@ -959,9 +971,13 @@ zip3 = zipWith3 (,,)
 {-# INLINE zip3 #-}
 
 zipWith :: (a -> b -> c) -> Vector a -> Vector b -> Vector c
-zipWith f v1 v2 = generate (min (length v1) (length v2)) $ \i ->
+zipWith f v1 v2 = zipWithDirect f v1 v2
+{-# NOINLINE [1] zipWith #-}
+
+zipWithDirect :: (a -> b -> c) -> Vector a -> Vector b -> Vector c
+zipWithDirect f v1 v2 = generate (min (length v1) (length v2)) $ \i ->
   f (unsafeIndex v1 i) (unsafeIndex v2 i)
-{-# INLINE zipWith #-}
+{-# INLINE zipWithDirect #-}
 
 zipWith3 :: (a -> b -> c -> d) -> Vector a -> Vector b -> Vector c -> Vector d
 zipWith3 f v1 v2 v3 = generate (min3 (length v1) (length v2) (length v3)) $ \i ->
@@ -1024,16 +1040,24 @@ ifilter p v = create $ \mv ->
 {-# INLINE ifilter #-}
 
 takeWhile :: (a -> Bool) -> Vector a -> Vector a
-takeWhile p v = case findIndex (not . p) v of
+takeWhile p v = takeWhileDirect p v
+{-# NOINLINE [1] takeWhile #-}
+
+takeWhileDirect :: (a -> Bool) -> Vector a -> Vector a
+takeWhileDirect p v = case findIndex (not . p) v of
   Nothing -> v
-  Just i  -> take i v
-{-# INLINE takeWhile #-}
+  Just i  -> takeDirect i v
+{-# INLINE takeWhileDirect #-}
 
 dropWhile :: (a -> Bool) -> Vector a -> Vector a
-dropWhile p v = case findIndex (not . p) v of
+dropWhile p v = dropWhileDirect p v
+{-# NOINLINE [1] dropWhile #-}
+
+dropWhileDirect :: (a -> Bool) -> Vector a -> Vector a
+dropWhileDirect p v = case findIndex (not . p) v of
   Nothing -> empty
-  Just i  -> drop i v
-{-# INLINE dropWhile #-}
+  Just i  -> dropDirect i v
+{-# INLINE dropWhileDirect #-}
 
 partition :: (a -> Bool) -> Vector a -> (Vector a, Vector a)
 partition p v = (filter p v, filter (not . p) v)
@@ -1095,53 +1119,21 @@ elemIndices x = findIndices (== x)
 ------------------------------------------------------------------------
 
 foldl :: (b -> a -> b) -> b -> Vector a -> b
-foldl f z0 v = foldr (\x k z -> k (f z x)) id v z0
+foldl f z0 v = foldrDirect (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 -- | O(n). Strict left fold.
--- The tree walk is in the where clause so that when foldl' is INLINE'd
--- at a call site with a known @f@, GHC specializes all inner loops.
+-- Fuses with upstream producers (map, filter, take, etc.) when the
+-- input is in stream form. Otherwise uses the direct tree-walking
+-- implementation which is specialized at the call site.
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' f = \ !z0 v ->
-  if vSize v == 0
-  then z0
-  else goTail (goNode z0 (vShift v) (vRoot v))
-              (vTail v) 0 (sizeofSmallArray (vTail v))
-  where
-    goNode !z !level0 node0 = case node0 of
-      Empty -> z
-      Leaf arr -> foldlChunk32 f z arr
-      Internal arr0
-        | level0 == bfBits -> goLvs z arr0 0
-        | level0 == 2 * bfBits -> goInts z arr0 0
-        | otherwise -> goDeep z level0 node0
-
-    goLvs !z !arr !i
-      | i >= bf   = z
-      | otherwise = case indexSmallArray arr i of
-          Leaf la -> goLvs (foldlChunk32 f z la) arr (i + 1)
-          Empty   -> goLvs z arr (i + 1)
-          _       -> goLvs z arr (i + 1)
-
-    goInts !z !arr !i
-      | i >= bf   = z
-      | otherwise = case indexSmallArray arr i of
-          Internal inner -> goInts (goLvs z inner 0) arr (i + 1)
-          Empty          -> goInts z arr (i + 1)
-          _              -> goInts z arr (i + 1)
-
-    goDeep !z !_ Empty = z
-    goDeep !z !_ (Leaf arr) = foldlChunk32 f z arr
-    goDeep !z !level (Internal arr) = goC z 0
-      where
-        goC !z' !i
-          | i >= bf   = z'
-          | otherwise = goC (goDeep z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
-
-    goTail !z !arr !i !limit
-      | i >= limit = z
-      | otherwise  = goTail (f z (indexSmallArray arr i)) arr (i + 1) limit
+foldl' = foldlDirect
 {-# INLINE foldl' #-}
+
+-- NOTE: foldlDirect is INLINE [1] so the consumer fusion rule
+-- @foldlDirect f z (unstream s) = sfoldl' f z s@ can fire before
+-- foldlDirect inlines. For standalone use, foldlDirect inlines at
+-- phase 1 and the tree walk gets specialized.
 
 -- | Walk the trie and fold over all leaf arrays.
 -- Unrolls depth-1 and depth-2 cases to avoid per-child Node pattern match.
@@ -1234,8 +1226,46 @@ goArr f = go
 {-# INLINE goArr #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
-foldlDirect = foldl'
-{-# INLINE foldlDirect #-}
+foldlDirect f = \ !z0 v ->
+  if vSize v == 0
+  then z0
+  else goTail (goNode z0 (vShift v) (vRoot v))
+              (vTail v) 0 (sizeofSmallArray (vTail v))
+  where
+    goNode !z !level0 node0 = case node0 of
+      Empty -> z
+      Leaf arr -> foldlChunk32 f z arr
+      Internal arr0
+        | level0 == bfBits -> goLvs z arr0 0
+        | level0 == 2 * bfBits -> goInts z arr0 0
+        | otherwise -> goDeep z level0 node0
+
+    goLvs !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Leaf la -> goLvs (foldlChunk32 f z la) arr (i + 1)
+          Empty   -> goLvs z arr (i + 1)
+          _       -> goLvs z arr (i + 1)
+
+    goInts !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Internal inner -> goInts (goLvs z inner 0) arr (i + 1)
+          Empty          -> goInts z arr (i + 1)
+          _              -> goInts z arr (i + 1)
+
+    goDeep !z !_ Empty = z
+    goDeep !z !_ (Leaf arr) = foldlChunk32 f z arr
+    goDeep !z !level (Internal arr) = goC z 0
+      where
+        goC !z' !i
+          | i >= bf   = z'
+          | otherwise = goC (goDeep z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+
+    goTail !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  = goTail (f z (indexSmallArray arr i)) arr (i + 1) limit
+{-# INLINE [1] foldlDirect #-}
 
 -- | Strict left fold, iterating a chunk function over all SmallArrays.
 foldlWithChunks :: (b -> SmallArray a -> Int -> b) -> b -> Vector a -> b
@@ -1303,8 +1333,13 @@ foldl1ViaNode f shift root tail_ =
       | otherwise = (error "pvector: no first elem", False)
 
 -- | O(n). Lazy right fold.
+-- Fuses with upstream producers when the input is in stream form.
 foldr :: (a -> b -> b) -> b -> Vector a -> b
-foldr f z0 v
+foldr = foldrDirect
+{-# INLINE foldr #-}
+
+foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
+foldrDirect f z0 v
   | vSize v == 0 = z0
   | otherwise    = goNode (vShift v) (vRoot v) (goArr (vTail v) 0 tailSz z0)
   where
@@ -1319,11 +1354,7 @@ foldr f z0 v
     goArr !arr !i !limit rest
       | i >= limit = rest
       | otherwise  = f (indexSmallArray arr i) (goArr arr (i + 1) limit rest)
-{-# INLINE foldr #-}
-
-foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
-foldrDirect = foldr
-{-# INLINE foldrDirect #-}
+{-# INLINE [1] foldrDirect #-}
 
 -- | Lazy right fold, calling a chunk function for each SmallArray.
 foldrWithChunks :: (SmallArray a -> Int -> b -> b) -> Vector a -> b -> b
@@ -1350,7 +1381,7 @@ foldrArr f arr = go
 {-# INLINE foldrArr #-}
 
 foldr' :: (a -> b -> b) -> b -> Vector a -> b
-foldr' f z0 v = foldl' (\k x -> k . f x) id v z0
+foldr' f z0 v = foldlDirect (\k x -> k . f x) id v z0
 {-# INLINE foldr' #-}
 
 foldr1 :: (a -> a -> a) -> Vector a -> a
@@ -1421,7 +1452,7 @@ ifoldr f z0 v
 {-# INLINE ifoldr #-}
 
 foldMap :: Monoid m => (a -> m) -> Vector a -> m
-foldMap f = foldl' (\acc a -> acc <> f a) mempty
+foldMap f = foldlDirect (\acc a -> acc <> f a) mempty
 {-# INLINE foldMap #-}
 
 foldMap' :: Monoid m => (a -> m) -> Vector a -> m
@@ -1453,11 +1484,11 @@ or = any id
 {-# INLINE or #-}
 
 sum :: Num a => Vector a -> a
-sum = foldl' (+) 0
+sum = foldlDirect (+) 0
 {-# INLINE sum #-}
 
 product :: Num a => Vector a -> a
-product = foldl' (*) 1
+product = foldlDirect (*) 1
 {-# INLINE product #-}
 
 maximum :: Ord a => Vector a -> a
@@ -1585,7 +1616,7 @@ enumFromThenTo lo next hi
 ------------------------------------------------------------------------
 
 toList :: Vector a -> [a]
-toList v = build (\c n -> foldr c n v)
+toList v = build (\c n -> foldrDirect c n v)
 {-# INLINE toList #-}
 
 fromVector :: F.Foldable f => f a -> Vector a
@@ -2294,6 +2325,10 @@ liftSmap f (MStream step s0) = MStream step' s0
 
 -- === Core fusion and recycling rules ===
 
+-- Short-circuit stream/unstream roundtrip (like vector's "stream/unstream")
+"pvector/stream/unstream"
+  forall s. stream (unstream s) = s
+
 -- Eliminates stream→new→fill→stream roundtrip
 "pvector/fusion"
   forall s. stream (new (fill s)) = s
@@ -2328,24 +2363,50 @@ liftSmap f (MStream step s0) = MStream step' s0
   stream (new (mapNew f p)) = S.smap f (stream (new p))
 
 -- === Stream forwarding: expose stream form for cross-operation fusion ===
+-- Phase [~1] fires early so the stream form is visible for composition.
 "pvector/map [stream]" [~1] forall f v.
   map f v = unstream (S.smap f (stream v))
 "pvector/filter [stream]" [~1] forall f v.
   filter f v = unstream (S.sfilter f (stream v))
-"pvector/foldl' [stream]" [~1] forall f z v.
-  foldl' f z v = S.sfoldl' f z (stream v)
-"pvector/foldr [stream]" [~1] forall f z v.
-  foldr f z v = S.sfoldr f z (stream v)
+"pvector/take [stream]" [~1] forall n v.
+  take n v = unstream (S.stake n (stream v))
+"pvector/drop [stream]" [~1] forall n v.
+  drop n v = unstream (S.sdrop n (stream v))
+"pvector/takeWhile [stream]" [~1] forall p v.
+  takeWhile p v = unstream (S.stakeWhile p (stream v))
+"pvector/dropWhile [stream]" [~1] forall p v.
+  dropWhile p v = unstream (S.sdropWhile p (stream v))
+"pvector/zipWith [stream]" [~1] forall f v1 v2.
+  zipWith f v1 v2 = unstream (S.szipWith f (stream v1) (stream v2))
+"pvector/mapMaybe [stream]" [~1] forall f v.
+  mapMaybe f v = unstream (S.smapMaybe f (stream v))
+-- === Consumer fusion: fuse folds when the input is already in stream form ===
+-- These match foldlDirect/foldrDirect (which foldl'/foldr inline to)
+-- applied to (unstream s). The stream/unstream roundtrip is eliminated,
+-- and the fold consumes the stream directly in a single fused loop.
+"pvector/foldlDirect/unstream" forall f z s.
+  foldlDirect f z (unstream s) = S.sfoldl' f z s
+"pvector/foldrDirect/unstream" forall f z s.
+  foldrDirect f z (unstream s) = S.sfoldr f z s
 
 -- === Fallback rules: revert to direct implementations when not fused ===
+-- Phase [1] fires late so only standalone (unfused) operations match.
 "pvector/map [direct]" [1] forall f v.
   unstream (S.smap f (stream v)) = mapDirect f v
 "pvector/filter [direct]" [1] forall f v.
   unstream (S.sfilter f (stream v)) = filterDirect f v
-"pvector/foldl' [direct]" [1] forall f z v.
-  S.sfoldl' f z (stream v) = foldlDirect f z v
-"pvector/foldr [direct]" [1] forall f z v.
-  S.sfoldr f z (stream v) = foldrDirect f z v
+"pvector/take [direct]" [1] forall n v.
+  unstream (S.stake n (stream v)) = takeDirect n v
+"pvector/drop [direct]" [1] forall n v.
+  unstream (S.sdrop n (stream v)) = dropDirect n v
+"pvector/takeWhile [direct]" [1] forall p v.
+  unstream (S.stakeWhile p (stream v)) = takeWhileDirect p v
+"pvector/dropWhile [direct]" [1] forall p v.
+  unstream (S.sdropWhile p (stream v)) = dropWhileDirect p v
+"pvector/zipWith [direct]" [1] forall f v1 v2.
+  unstream (S.szipWith f (stream v1) (stream v2)) = zipWithDirect f v1 v2
+"pvector/mapMaybe [direct]" [1] forall f v.
+  unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
 
   #-}
 

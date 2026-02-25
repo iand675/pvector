@@ -58,6 +58,10 @@ module Data.PVector.Internal.Stream
   , sifilter
   , stake
   , sdrop
+  , stakeWhile
+  , sdropWhile
+  , smapMaybe
+  , szipWith
   , sconcat
 
     -- * Bundle consumers
@@ -349,6 +353,52 @@ sconcat (Bundle (MStream stepL sL0) szL) (Bundle (MStream stepR sR0) szR) =
       Done       -> Id Done
 {-# INLINE [1] sconcat #-}
 
+stakeWhile :: (a -> Bool) -> Bundle a -> Bundle a
+stakeWhile p (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) (toMax sz)
+  where
+    step' s = case unId (step s) of
+      Yield a s' | p a       -> Id (Yield a s')
+                 | otherwise -> Id Done
+      Skip    s'             -> Id (Skip s')
+      Done                   -> Id Done
+{-# INLINE [0] stakeWhile #-}
+
+sdropWhile :: (a -> Bool) -> Bundle a -> Bundle a
+sdropWhile p (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, True)) (toMax sz)
+  where
+    step' (s, dropping) = case unId (step s) of
+      Yield a s'
+        | dropping && p a -> Id (Skip (s', True))
+        | otherwise       -> Id (Yield a (s', False))
+      Skip    s'          -> Id (Skip (s', dropping))
+      Done                -> Id Done
+{-# INLINE [0] sdropWhile #-}
+
+smapMaybe :: (a -> Maybe b) -> Bundle a -> Bundle b
+smapMaybe f (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) (toMax sz)
+  where
+    step' s = case unId (step s) of
+      Yield a s' -> case f a of
+        Just b  -> Id (Yield b s')
+        Nothing -> Id (Skip s')
+      Skip    s' -> Id (Skip s')
+      Done       -> Id Done
+{-# INLINE [0] smapMaybe #-}
+
+szipWith :: (a -> b -> c) -> Bundle a -> Bundle b -> Bundle c
+szipWith f (Bundle (MStream stepA sA0) szA) (Bundle (MStream stepB sB0) szB) =
+  Bundle (MStream step' (sA0, sB0, Nothing)) (szA `smaller` szB)
+  where
+    step' (sA, sB, Nothing) = case unId (stepA sA) of
+      Yield a sA' -> Id (Skip (sA', sB, Just a))
+      Skip    sA' -> Id (Skip (sA', sB, Nothing))
+      Done        -> Id Done
+    step' (sA, sB, Just a) = case unId (stepB sB) of
+      Yield b sB' -> Id (Yield (f a b) (sA, sB', Nothing))
+      Skip    sB' -> Id (Skip (sA, sB', Just a))
+      Done        -> Id Done
+{-# INLINE [0] szipWith #-}
+
 ------------------------------------------------------------------------
 -- Consumers
 ------------------------------------------------------------------------
@@ -561,10 +611,28 @@ sscanl1M' f (MStream step s0) = MStream step' (s0, Nothing)
 ------------------------------------------------------------------------
 
 {-# RULES
+
+-- === Map composition ===
 "smap/smap"       forall f g s.  smap f (smap g s)       = smap (f . g) s
+
+-- === Filter composition ===
 "sfilter/sfilter" forall f g s.  sfilter f (sfilter g s) = sfilter (\x -> g x && f x) s
+
+-- === Map/filter interaction: push filter before map ===
 "smap/sfilter"    forall f p s.  sfilter p (smap f s)    = smap f (sfilter (p . f) s)
 
+-- === Take/drop through map: push map inside ===
+"smap/stake"      forall f n s.  stake n (smap f s)      = smap f (stake n s)
+"smap/sdrop"      forall f n s.  sdrop n (smap f s)      = smap f (sdrop n s)
+
+-- === Filter through take/drop ===
+"stake/sfilter"   forall n p s.  stake n (sfilter p s)   = sfilter p (stake n s)
+
+-- === takeWhile/dropWhile through map ===
+"smap/stakeWhile" forall f p s.  stakeWhile p (smap f s) = smap f (stakeWhile (p . f) s)
+"smap/sdropWhile" forall f p s.  sdropWhile p (smap f s) = smap f (sdropWhile (p . f) s)
+
+-- === Inplace composition ===
 "inplace/inplace [pvector]"
   forall (f1 :: forall m. Monad m => MStream m a -> MStream m a)
          (f2 :: forall m. Monad m => MStream m a -> MStream m a)
