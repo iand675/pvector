@@ -404,21 +404,95 @@ singleton x = Vector 1 bfBits emptyRoot tail_
 {-# INLINE singleton #-}
 
 -- | O(n). Build a vector from a list.
+-- The inner loop writes directly into the tail buffer, only touching
+-- the MutVar when the tail is full and needs flushing.
 fromList :: [a] -> Vector a
-fromList xs = create $ \mv ->
-  let go []     = pure ()
-      go (a:as) = mPush mv a >> go as
-  in go xs
+fromList [] = empty
+fromList xs = runST $ do
+  mv <- mNew
+  st0 <- getMV mv
+  goFill mv (mvTail st0) 0 xs
+  unsafeFreeze mv
+  where
+    -- Fast inner loop: write straight into the tail buffer.
+    -- Only reads/writes the MutVar when the buffer fills up.
+    goFill !mv !tail_ !ti [] = do
+      st <- getMV mv
+      putMV mv st { mvSize = mvSize st + ti - mvTailSize st
+                   , mvTailSize = ti }
+    goFill !mv !tail_ !ti (a:as)
+      | ti < bf = do
+          writeSmallArray tail_ ti a
+          goFill mv tail_ (ti + 1) as
+      | otherwise = do
+          -- Tail is full at bf elements. Flush.
+          st <- getMV mv
+          let !n = mvSize st + (bf - mvTailSize st)
+          frozenTail <- unsafeFreezeSmallArray tail_
+          let !willOverflow = unsafeShiftR n bfBits > unsafeShiftL 1 (mvShift st)
+          (newRoot, newShift) <-
+            if willOverflow
+              then do
+                arr <- newSmallArray bf (Frozen Empty)
+                writeSmallArray arr 0 (mvRoot st)
+                let !path = thawNode (newPath (mvShift st) (Leaf frozenTail))
+                writeSmallArray arr 1 path
+                pure (MInternal arr, mvShift st + bfBits)
+              else do
+                r <- mPushTail n (mvShift st) (mvRoot st) frozenTail
+                pure (r, mvShift st)
+          newTail <- newSmallArray bf undefinedElem'
+          writeSmallArray newTail 0 a
+          putMV mv $! MVState (n + 1) newShift newRoot newTail 1
+          goFill mv newTail 1 as
+    undefinedElem' = error "pvector: uninitialised"
+{-# INLINE [1] fromList #-}
 
 -- | O(n). Build a vector from the first @n@ elements of a list.
 fromListN :: Int -> [a] -> Vector a
 fromListN n xs
   | n <= 0    = empty
-  | otherwise = create $ \mv ->
-      let go _ []     = pure ()
-          go 0 _      = pure ()
-          go i (a:as) = mPush mv a >> go (i - 1) as
-      in go n xs
+  | otherwise = runST $ do
+      mv <- mNew
+      st0 <- getMV mv
+      goFillN mv (mvTail st0) 0 n xs
+      unsafeFreeze mv
+  where
+    goFillN !mv !tail_ !ti !remaining [] = do
+      st <- getMV mv
+      putMV mv st { mvSize = mvSize st + ti - mvTailSize st
+                   , mvTailSize = ti }
+    goFillN !mv !tail_ !ti !remaining _
+      | remaining <= 0 = do
+          st <- getMV mv
+          putMV mv st { mvSize = mvSize st + ti - mvTailSize st
+                       , mvTailSize = ti }
+    goFillN !mv !tail_ !ti !remaining (a:as)
+      | ti < bf = do
+          writeSmallArray tail_ ti a
+          goFillN mv tail_ (ti + 1) (remaining - 1) as
+      | otherwise = do
+          st <- getMV mv
+          let !n = mvSize st + (bf - mvTailSize st)
+          frozenTail <- unsafeFreezeSmallArray tail_
+          let !willOverflow = unsafeShiftR n bfBits > unsafeShiftL 1 (mvShift st)
+          (newRoot, newShift) <-
+            if willOverflow
+              then do
+                arr <- newSmallArray bf (Frozen Empty)
+                writeSmallArray arr 0 (mvRoot st)
+                let !path = thawNode (newPath (mvShift st) (Leaf frozenTail))
+                writeSmallArray arr 1 path
+                pure (MInternal arr, mvShift st + bfBits)
+              else do
+                r <- mPushTail n (mvShift st) (mvRoot st) frozenTail
+                pure (r, mvShift st)
+          newTail <- newSmallArray bf undefinedElem'
+          writeSmallArray newTail 0 a
+          putMV mv $! MVState (n + 1) newShift newRoot newTail 1
+          goFillN mv newTail 1 (remaining - 1) as
+    undefinedElem' = error "pvector: uninitialised"
+{-# INLINE [1] fromListN #-}
 
 replicate :: Int -> a -> Vector a
 replicate n x
