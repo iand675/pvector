@@ -392,11 +392,11 @@ instance Alternative Vector where
 ------------------------------------------------------------------------
 
 empty :: Vector a
-empty = Vector 0 bfBits emptyRoot emptyTail
+empty = Vector 0 bfBits Empty emptyTail
 {-# INLINE empty #-}
 
 singleton :: a -> Vector a
-singleton x = Vector 1 bfBits emptyRoot tail_
+singleton x = Vector 1 bfBits Empty tail_
   where
     !tail_ = runST $ do
       a <- newSmallArray 1 x
@@ -779,7 +779,7 @@ unsnoc v
           !newTail  = leafFor (vShift v) (n - 2) (vRoot v)
           !rootPop  = popTail n (vShift v) (vRoot v)
           !newRoot  = case rootPop of
-                        Nothing -> emptyRoot
+                        Nothing -> Empty
                         Just r  -> r
           (!newShift, !newRoot') = case newRoot of
             Internal arr
@@ -1952,9 +1952,7 @@ unsafeFreeze mv = do
         | sizeofSmallArray frozenTail > mvTailSize st
           = cloneSmallArray frozenTail 0 (mvTailSize st)
         | otherwise = frozenTail
-      !frozenRoot = case frozenRoot0 of
-        Empty -> emptyRoot
-        _     -> frozenRoot0
+      !frozenRoot = frozenRoot0
   pure $! Vector (mvSize st) (mvShift st) frozenRoot tail_
 {-# INLINE unsafeFreeze #-}
 
@@ -2468,6 +2466,7 @@ newPath level node =
 pushTail :: Int -> Int -> Node a -> SmallArray a -> Node a
 pushTail size shift root tailArr = go shift root
   where
+    go _ Empty = newPath shift (Leaf tailArr)
     go level (Internal arr) =
       let !subIdx = indexAtLevel (size - 1) level
       in if level == bfBits
