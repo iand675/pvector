@@ -1080,14 +1080,48 @@ foldl f z0 v = foldr (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 -- | O(n). Strict left fold.
+-- The tree walk is in the where clause so that when foldl' is INLINE'd
+-- at a call site with a known @f@, GHC specializes all inner loops.
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
 foldl' f = \ !z0 v ->
   if vSize v == 0
   then z0
-  else let fchunk = foldlChunk32 f
-           ftail  = goArr f
-       in ftail (goNodeWith fchunk z0 (vShift v) (vRoot v))
-               (vTail v) 0 (sizeofSmallArray (vTail v))
+  else goTail (goNode z0 (vShift v) (vRoot v))
+              (vTail v) 0 (sizeofSmallArray (vTail v))
+  where
+    goNode !z !level0 node0 = case node0 of
+      Empty -> z
+      Leaf arr -> foldlChunk32 f z arr
+      Internal arr0
+        | level0 == bfBits -> goLvs z arr0 0
+        | level0 == 2 * bfBits -> goInts z arr0 0
+        | otherwise -> goDeep z level0 node0
+
+    goLvs !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Leaf la -> goLvs (foldlChunk32 f z la) arr (i + 1)
+          Empty   -> goLvs z arr (i + 1)
+          _       -> goLvs z arr (i + 1)
+
+    goInts !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Internal inner -> goInts (goLvs z inner 0) arr (i + 1)
+          Empty          -> goInts z arr (i + 1)
+          _              -> goInts z arr (i + 1)
+
+    goDeep !z !_ Empty = z
+    goDeep !z !_ (Leaf arr) = foldlChunk32 f z arr
+    goDeep !z !level (Internal arr) = goC z 0
+      where
+        goC !z' !i
+          | i >= bf   = z'
+          | otherwise = goC (goDeep z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+
+    goTail !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  = goTail (f z (indexSmallArray arr i)) arr (i + 1) limit
 {-# INLINE foldl' #-}
 
 -- | Walk the trie and fold over all leaf arrays.
@@ -2141,9 +2175,6 @@ liftSmap f (MStream step s0) = MStream step' s0
 -- Uninplace: undo in-place when result is immediately streamed
 "pvector/uninplace/map" forall f p.
   stream (new (mapNew f p)) = S.smap f (stream (new p))
-
--- Specialise map to inplace_map when the type allows (a -> a)
-"pvector/map/inplace" map = inplace_map
 
 -- === Stream forwarding: expose stream form for cross-operation fusion ===
 "pvector/map [stream]" [~1] forall f v.
