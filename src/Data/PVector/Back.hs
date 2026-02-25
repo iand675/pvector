@@ -2771,8 +2771,7 @@ liftSmap f (MStream step s0) = MStream step' s0
 
   #-}
 
--- TODO: Vector-library rules not yet ported. These may be worth adopting
--- if the corresponding features are added to pvector.
+-- TODO: Vector-library rules not yet ported.
 --
 -- == Reverse streaming (requires streamR/unstreamR infrastructure) ==
 --   "streamR/unstreamR"              streamR (new (unstreamR s)) = s
@@ -2784,30 +2783,93 @@ liftSmap f (MStream step s0) = MStream step' s0
 --   "transformR/transformR [New]"    compose reverse transforms
 --   "transformR/unstreamR [New]"     fold reverse transform into bundle
 --
--- == Monadic consumer forwarding (requires indexM/headM/lastM support) ==
---   "indexM/unstream"                indexM (new (fill s)) i = sindex s i  (in a monad)
---   "headM/unstream"                headM (new (fill s)) = shead s  (in a monad)
---   "lastM/unstream"                lastM (new (fill s)) = slast s  (in a monad)
---   "unsafeIndexM/unstream"         ditto, unsafe variant
---   "unsafeHeadM/unstream"          ditto
---   "unsafeLastM/unstream"          ditto
+-- == Monadic consumer forwarding ==
+--   "indexM/unstream"   "headM/unstream"   "lastM/unstream"
+--   "unsafeIndexM/unstream"   "unsafeHeadM/unstream"   "unsafeLastM/unstream"
 --
 -- == Self-zip optimisation ==
---   "szipWith xs xs"                szipWith f s s = smap (\x -> f x x) s
---   Turns a self-zip into a map. Requires detecting that both bundle
---   arguments are the same (via 'lift' in vector; pvector would need
---   an equivalent tagging mechanism).
+--   "szipWith xs xs"    szipWith f s s = smap (\x -> f x x) s
 --
--- == enumFromTo specialisations (requires Enum-based construction API) ==
---   "enumFromTo<Int>"               use tight Int loop
---   "enumFromTo<Word>"              use tight Word loop
---   "enumFromTo<Char>"              use tight Char loop
---   "enumFromTo<Double>"            use floating-point loop
---   ... and ~12 more for Int8/16/32/64, Word8/16/32/64, Float, Integer
+-- == enumFromTo specialisations ==
+--   Type-specialised loops for Int, Word, Char, Double, etc.
 --
 -- == unstablePartition ==
---   "unstablePartition"             fuse partition with stream to avoid
---                                   materialising intermediate vector
+--   Fuse partition with stream to avoid materialising intermediate vector.
+--
+------------------------------------------------------------------------
+-- TODO: pvector-specific rules exploiting the chunked trie structure.
+-- These have no analogue in the flat-array vector library.
+------------------------------------------------------------------------
+--
+-- == Trie-preserving identity rules ==
+--
+--   "map id"             map id v = v
+--   "reverse/reverse"    reverse (reverse v) = v
+--   "fromList/toList"    fromList (toList v) = v
+--
+--   These avoid O(n) reconstruction when the result is the same
+--   vector.  Especially valuable when id/reverse arise from
+--   specialisation or inlining (e.g. map id after a type coercion).
+--
+-- == Tree-sharing take/drop ==
+--
+--   The current takeDirect/dropDirect use `generate`, which walks
+--   the old trie element-by-element and builds a completely new one.
+--   A trie-aware implementation could share entire subtrees that fall
+--   entirely within (or outside) the sliced range:
+--
+--     takeDirect n v   -- share all subtrees whose index range ⊆ [0,n)
+--     dropDirect n v   -- share all subtrees whose index range ⊆ [n,size)
+--
+--   For take 9000 on a 10000-element vector, this would share ~280
+--   of 312 leaf arrays and rebuild only the boundary path.  Cost
+--   drops from O(n) to O(log₃₂ n).
+--
+-- == Chunk-level stream fusion ==
+--
+--   See the detailed design note in Data.PVector.Internal.Stream.
+--   The idea: a second stream type that yields 32-element SmallArrays
+--   instead of individual elements, enabling fused pipelines to use
+--   tight inner loops (foldlChunk32, mapChunk32).
+--
+--   This would close the gap on fused pipelines like foldl' . map,
+--   where pvector's element-level stream fusion loses to Vector but
+--   pvector's standalone foldl' already wins via chunk walking.
+--
+-- == Direct chunk-fused consumers ==
+--
+--   Even without a full chunk stream, specific consumer+transformer
+--   pairs can be fused at the tree level:
+--
+--   "foldl'/map [chunk-fused]"
+--     foldl' f z (map g v) = foldChunks (\acc _ arr -> foldlArr (\b a -> f b (g a)) acc arr) z v
+--
+--   "foldl'/filter [chunk-fused]"
+--     foldl' f z (filter p v) = foldChunks (\acc _ arr -> foldlArr (\b a -> if p a then f b a else b) acc arr) z v
+--
+--   These bypass stream creation entirely. Each leaf chunk is
+--   processed in a tight 32-element loop.  The allPassChunk
+--   optimisation in filterDirect is a step in this direction.
+--
+-- == Chunk-aware zipWith ==
+--
+--   When zipping two PVectors of equal size, the trie structures
+--   are isomorphic.  A direct zipChunks could walk both tries in
+--   lockstep, pairing corresponding leaf SmallArrays:
+--
+--     zipWithDirect f v1 v2 = mapChunks (\off arr1 ->
+--       zipChunk32 f arr1 (leafAt off v2)) v1
+--
+--   This is more cache-friendly than the element-by-element stream
+--   zip because it accesses both arrays sequentially.
+--
+-- == Concat map / flatMap fusion ==
+--
+--   concatMap f v = concat (map f v)
+--
+--   If f consistently produces 32-element vectors, the output can
+--   be built with mPushChunk instead of element-by-element mPush.
+--   A specialised concatMapChunked could detect this at runtime.
 
 ------------------------------------------------------------------------
 -- Internal tree operations
