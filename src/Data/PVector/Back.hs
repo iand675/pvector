@@ -352,7 +352,7 @@ instance F.Foldable Vector where
   {-# INLINE toList #-}
 
 instance Traversable Vector where
-  traverse f v = foldl' (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) v
+  traverse f v = foldlDirect (\acc a -> snoc <$> acc <*> f a) (Prelude.pure empty) v
   {-# INLINE traverse #-}
 
 instance Exts.IsList (Vector a) where
@@ -392,11 +392,11 @@ instance Alternative Vector where
 ------------------------------------------------------------------------
 
 empty :: Vector a
-empty = Vector 0 bfBits emptyRoot emptyTail
+empty = Vector 0 bfBits Empty emptyTail
 {-# INLINE empty #-}
 
 singleton :: a -> Vector a
-singleton x = Vector 1 bfBits emptyRoot tail_
+singleton x = Vector 1 bfBits Empty tail_
   where
     !tail_ = runST $ do
       a <- newSmallArray 1 x
@@ -497,10 +497,18 @@ fromListN n xs
 replicate :: Int -> a -> Vector a
 replicate n x
   | n <= 0    = empty
-  | otherwise = create $ \mv ->
-      let go 0 = pure ()
-          go i = mPush mv x >> go (i - 1)
-      in go n
+  | otherwise = create $ \mv -> do
+      sharedChunk <- newSmallArray bf x >>= unsafeFreezeSmallArray
+      let !fullChunks = unsafeShiftR n bfBits
+          !remaining  = n .&. bfMask
+          goChunks !i
+            | i >= fullChunks = pure ()
+            | otherwise = mPushChunk mv sharedChunk >> goChunks (i + 1)
+          goRem !i
+            | i >= remaining = pure ()
+            | otherwise = mPush mv x >> goRem (i + 1)
+      goChunks 0
+      goRem 0
 {-# INLINE replicate #-}
 
 -- | O(n). Build a vector from a list of full 32-element SmallArrays
@@ -599,16 +607,37 @@ snoc v x
 (<|) = cons
 {-# INLINE (<|) #-}
 
--- | O(n+m). Concatenate. Fuses: @(a ++ b) ++ c@ eliminates intermediate.
+-- | O(n+m). Concatenate.
 (++) :: Vector a -> Vector a -> Vector a
-v1 ++ v2 = unstream (S.sconcat (stream v1) (stream v2))
+(++) = append
 {-# INLINE (++) #-}
 
 concat :: [Vector a] -> Vector a
-concat vs = create $ \mv ->
-  let go []     = pure ()
-      go (v:vs') = forEach_ v (mPush mv) >> go vs'
-  in go vs
+concat [] = empty
+concat [v] = v
+concat vs = create $ \mv -> do
+  buf <- newSmallArray bf uninitElem
+  let go !b !off [] = flushBuf b off mv
+      go !b !off (v:vs')
+        | vSize v == 0 = go b off vs'
+        | off == 0 = do
+            pushNodeChunks (vShift v) (vRoot v) mv
+            let !tail_ = vTail v
+                !k = sizeofSmallArray tail_
+            if k == bf
+              then do
+                mPushChunk mv tail_
+                go b 0 vs'
+              else do
+                copySmallArray b 0 tail_ 0 k
+                go b k vs'
+        | otherwise = do
+            (b', off') <- pushNodeBuffered b off (vShift v) (vRoot v) mv
+            let !tail_ = vTail v
+                !tailSz = sizeofSmallArray tail_
+            (b'', off'') <- copyBuffered b' off' tail_ 0 tailSz mv
+            go b'' off'' vs'
+  go buf 0 vs
 {-# INLINE concat #-}
 
 -- | Fully evaluate the vector and its elements.
@@ -706,18 +735,26 @@ tail v
 {-# INLINE tail #-}
 
 take :: Int -> Vector a -> Vector a
-take n v
+take n v = takeDirect n v
+{-# NOINLINE [1] take #-}
+
+takeDirect :: Int -> Vector a -> Vector a
+takeDirect n v
   | n <= 0        = empty
   | n >= vSize v  = v
   | otherwise     = generate n (unsafeIndex v)
-{-# INLINE take #-}
+{-# INLINE takeDirect #-}
 
 drop :: Int -> Vector a -> Vector a
-drop n v
+drop n v = dropDirect n v
+{-# NOINLINE [1] drop #-}
+
+dropDirect :: Int -> Vector a -> Vector a
+dropDirect n v
   | n <= 0        = v
   | n >= vSize v  = empty
   | otherwise     = generate (vSize v - n) (\i -> unsafeIndex v (i + n))
-{-# INLINE drop #-}
+{-# INLINE dropDirect #-}
 
 splitAt :: Int -> Vector a -> (Vector a, Vector a)
 splitAt n v = (take n v, drop n v)
@@ -742,7 +779,7 @@ unsnoc v
           !newTail  = leafFor (vShift v) (n - 2) (vRoot v)
           !rootPop  = popTail n (vShift v) (vRoot v)
           !newRoot  = case rootPop of
-                        Nothing -> emptyRoot
+                        Nothing -> Empty
                         Just r  -> r
           (!newShift, !newRoot') = case newRoot of
             Internal arr
@@ -850,24 +887,20 @@ mapDirect f v
   where
     !n = vSize v
     !newTail = mapArray' f (vTail v)
-    !newRoot = mapNode (vShift v) f (vRoot v)
-{-# INLINE mapDirect #-}
+    !newRoot = goNode (vShift v) (vRoot v)
 
-{-# INLINEABLE mapNode #-}
-mapNode :: Int -> (a -> b) -> Node a -> Node b
-mapNode _ _ Empty = Empty
-mapNode _ f (Leaf arr) = Leaf (mapChunk32 f arr)
-mapNode shift f (Internal arr) = Internal $ runST $ do
-  marr <- newSmallArray bf Empty
-  let !n = bf
-  let go i
-        | i >= n = pure ()
-        | otherwise = do
-            let !child = indexSmallArray arr i
-            writeSmallArray marr i (mapNode (shift - bfBits) f child)
-            go (i + 1)
-  go 0
-  unsafeFreezeSmallArray marr
+    goNode !_ Empty = Empty
+    goNode !_ (Leaf arr) = Leaf (mapChunk32 f arr)
+    goNode !shift (Internal arr) = Internal $ runST $ do
+      marr <- newSmallArray bf Empty
+      let go i
+            | i >= bf = pure ()
+            | otherwise = do
+                writeSmallArray marr i (goNode (shift - bfBits) (indexSmallArray arr i))
+                go (i + 1)
+      go 0
+      unsafeFreezeSmallArray marr
+{-# INLINE mapDirect #-}
 
 -- | O(n). Map with index.
 imap :: (Int -> a -> b) -> Vector a -> Vector b
@@ -880,11 +913,15 @@ concatMap f v = create $ \mv ->
 {-# INLINE concatMap #-}
 
 mapMaybe :: (a -> Maybe b) -> Vector a -> Vector b
-mapMaybe f v = create $ \mv ->
+mapMaybe f v = mapMaybeDirect f v
+{-# NOINLINE [1] mapMaybe #-}
+
+mapMaybeDirect :: (a -> Maybe b) -> Vector a -> Vector b
+mapMaybeDirect f v = create $ \mv ->
   forEach_ v $ \a -> case f a of
     Nothing -> pure ()
     Just b  -> mPush mv b
-{-# INLINE mapMaybe #-}
+{-# INLINE mapMaybeDirect #-}
 
 imapMaybe :: (Int -> a -> Maybe b) -> Vector a -> Vector b
 imapMaybe f v = create $ \mv ->
@@ -898,11 +935,11 @@ imapMaybe f v = create $ \mv ->
 ------------------------------------------------------------------------
 
 mapM :: Monad m => (a -> m b) -> Vector a -> m (Vector b)
-mapM f v = foldl' (\acc a -> acc >>= \v' -> f a >>= \b -> pure (snoc v' b)) (pure empty) v
+mapM f v = foldlDirect (\acc a -> acc >>= \v' -> f a >>= \b -> pure (snoc v' b)) (pure empty) v
 {-# INLINE mapM #-}
 
 mapM_ :: Monad m => (a -> m b) -> Vector a -> m ()
-mapM_ f = foldl' (\m a -> m >> f a >> pure ()) (pure ())
+mapM_ f = foldlDirect (\m a -> m >> f a >> pure ()) (pure ())
 {-# INLINE mapM_ #-}
 
 forM :: Monad m => Vector a -> (a -> m b) -> m (Vector b)
@@ -914,11 +951,11 @@ forM_ = flip mapM_
 {-# INLINE forM_ #-}
 
 imapM :: Monad m => (Int -> a -> m b) -> Vector a -> m (Vector b)
-imapM f v = ifoldl' (\acc i a -> acc >>= \v' -> f i a >>= \b -> pure (snoc v' b)) (pure empty) v
+imapM f v = ifoldl' (\acc i a -> acc >>= \v' -> f i a >>= \b -> pure (snoc v' b)) (Prelude.pure empty) v
 {-# INLINE imapM #-}
 
 imapM_ :: Monad m => (Int -> a -> m ()) -> Vector a -> m ()
-imapM_ f = ifoldl' (\m i a -> m >> f i a) (pure ())
+imapM_ f = ifoldl' (\m i a -> m >> f i a) (Prelude.pure ())
 {-# INLINE imapM_ #-}
 
 ------------------------------------------------------------------------
@@ -934,9 +971,13 @@ zip3 = zipWith3 (,,)
 {-# INLINE zip3 #-}
 
 zipWith :: (a -> b -> c) -> Vector a -> Vector b -> Vector c
-zipWith f v1 v2 = generate (min (length v1) (length v2)) $ \i ->
+zipWith f v1 v2 = zipWithDirect f v1 v2
+{-# NOINLINE [1] zipWith #-}
+
+zipWithDirect :: (a -> b -> c) -> Vector a -> Vector b -> Vector c
+zipWithDirect f v1 v2 = generate (min (length v1) (length v2)) $ \i ->
   f (unsafeIndex v1 i) (unsafeIndex v2 i)
-{-# INLINE zipWith #-}
+{-# INLINE zipWithDirect #-}
 
 zipWith3 :: (a -> b -> c -> d) -> Vector a -> Vector b -> Vector c -> Vector d
 zipWith3 f v1 v2 v3 = generate (min3 (length v1) (length v2) (length v3)) $ \i ->
@@ -966,37 +1007,31 @@ filter :: (a -> Bool) -> Vector a -> Vector a
 filter p = filterDirect p
 {-# NOINLINE [1] filter #-}
 
-filterDirect :: (a -> Bool) -> Vector a -> Vector a
+filterDirect :: forall a. (a -> Bool) -> Vector a -> Vector a
 filterDirect p v
-  | n == 0 = empty
+  | vSize v == 0 = empty
   | otherwise = create $ \mv -> do
-      filterNode p mv (vShift v) (vRoot v)
-      filterChunk p mv (vTail v) 0 (sizeofSmallArray (vTail v))
-  where !n = vSize v
-{-# INLINE filterDirect #-}
-
-{-# INLINEABLE filterNode #-}
-filterNode :: (a -> Bool) -> MVector s a -> Int -> Node a -> ST s ()
-filterNode _ _ _ Empty = pure ()
-filterNode p mv _ (Leaf arr) = filterChunk p mv arr 0 bf
-filterNode p mv level (Internal arr) = do
-  let !n = bf
-      go i | i >= n = pure ()
-           | otherwise = do
-               filterNode p mv (level - bfBits) (indexSmallArray arr i)
-               go (i + 1)
-  go 0
-
-{-# INLINEABLE filterChunk #-}
-filterChunk :: (a -> Bool) -> MVector s a -> SmallArray a -> Int -> Int -> ST s ()
-filterChunk p mv arr = go
+      goNode (vShift v) (vRoot v) mv
+      goChunk (vTail v) 0 (sizeofSmallArray (vTail v)) mv
   where
-    go !i !limit
+    goNode :: Int -> Node a -> MVector s a -> ST s ()
+    goNode !_ Empty !_ = pure ()
+    goNode !_ (Leaf arr) !mv = goChunk arr 0 bf mv
+    goNode !level (Internal arr) !mv = do
+      let go i | i >= bf   = pure ()
+               | otherwise = do
+                   goNode (level - bfBits) (indexSmallArray arr i) mv
+                   go (i + 1)
+      go 0
+
+    goChunk :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
+    goChunk !arr !i !limit !mv
       | i >= limit = pure ()
       | otherwise = do
           let !a = indexSmallArray arr i
           when (p a) (mPush mv a)
-          go (i + 1) limit
+          goChunk arr (i + 1) limit mv
+{-# INLINE filterDirect #-}
 
 -- | O(n). Filter with index.
 ifilter :: (Int -> a -> Bool) -> Vector a -> Vector a
@@ -1005,16 +1040,24 @@ ifilter p v = create $ \mv ->
 {-# INLINE ifilter #-}
 
 takeWhile :: (a -> Bool) -> Vector a -> Vector a
-takeWhile p v = case findIndex (not . p) v of
+takeWhile p v = takeWhileDirect p v
+{-# NOINLINE [1] takeWhile #-}
+
+takeWhileDirect :: (a -> Bool) -> Vector a -> Vector a
+takeWhileDirect p v = case findIndex (not . p) v of
   Nothing -> v
-  Just i  -> take i v
-{-# INLINE takeWhile #-}
+  Just i  -> takeDirect i v
+{-# INLINE takeWhileDirect #-}
 
 dropWhile :: (a -> Bool) -> Vector a -> Vector a
-dropWhile p v = case findIndex (not . p) v of
+dropWhile p v = dropWhileDirect p v
+{-# NOINLINE [1] dropWhile #-}
+
+dropWhileDirect :: (a -> Bool) -> Vector a -> Vector a
+dropWhileDirect p v = case findIndex (not . p) v of
   Nothing -> empty
-  Just i  -> drop i v
-{-# INLINE dropWhile #-}
+  Just i  -> dropDirect i v
+{-# INLINE dropWhileDirect #-}
 
 partition :: (a -> Bool) -> Vector a -> (Vector a, Vector a)
 partition p v = (filter p v, filter (not . p) v)
@@ -1076,19 +1119,21 @@ elemIndices x = findIndices (== x)
 ------------------------------------------------------------------------
 
 foldl :: (b -> a -> b) -> b -> Vector a -> b
-foldl f z0 v = foldr (\x k z -> k (f z x)) id v z0
+foldl f z0 v = foldrDirect (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 -- | O(n). Strict left fold.
+-- Fuses with upstream producers (map, filter, take, etc.) when the
+-- input is in stream form. Otherwise uses the direct tree-walking
+-- implementation which is specialized at the call site.
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' f = \ !z0 v ->
-  if vSize v == 0
-  then z0
-  else let fchunk = foldlChunk32 f
-           ftail  = goArr f
-       in ftail (goNodeWith fchunk z0 (vShift v) (vRoot v))
-               (vTail v) 0 (sizeofSmallArray (vTail v))
+foldl' = foldlDirect
 {-# INLINE foldl' #-}
+
+-- NOTE: foldlDirect is INLINE [1] so the consumer fusion rule
+-- @foldlDirect f z (unstream s) = sfoldl' f z s@ can fire before
+-- foldlDirect inlines. For standalone use, foldlDirect inlines at
+-- phase 1 and the tree walk gets specialized.
 
 -- | Walk the trie and fold over all leaf arrays.
 -- Unrolls depth-1 and depth-2 cases to avoid per-child Node pattern match.
@@ -1181,8 +1226,46 @@ goArr f = go
 {-# INLINE goArr #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
-foldlDirect = foldl'
-{-# INLINE foldlDirect #-}
+foldlDirect f = \ !z0 v ->
+  if vSize v == 0
+  then z0
+  else goTail (goNode z0 (vShift v) (vRoot v))
+              (vTail v) 0 (sizeofSmallArray (vTail v))
+  where
+    goNode !z !level0 node0 = case node0 of
+      Empty -> z
+      Leaf arr -> foldlChunk32 f z arr
+      Internal arr0
+        | level0 == bfBits -> goLvs z arr0 0
+        | level0 == 2 * bfBits -> goInts z arr0 0
+        | otherwise -> goDeep z level0 node0
+
+    goLvs !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Leaf la -> goLvs (foldlChunk32 f z la) arr (i + 1)
+          Empty   -> goLvs z arr (i + 1)
+          _       -> goLvs z arr (i + 1)
+
+    goInts !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Internal inner -> goInts (goLvs z inner 0) arr (i + 1)
+          Empty          -> goInts z arr (i + 1)
+          _              -> goInts z arr (i + 1)
+
+    goDeep !z !_ Empty = z
+    goDeep !z !_ (Leaf arr) = foldlChunk32 f z arr
+    goDeep !z !level (Internal arr) = goC z 0
+      where
+        goC !z' !i
+          | i >= bf   = z'
+          | otherwise = goC (goDeep z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+
+    goTail !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  = goTail (f z (indexSmallArray arr i)) arr (i + 1) limit
+{-# INLINE [1] foldlDirect #-}
 
 -- | Strict left fold, iterating a chunk function over all SmallArrays.
 foldlWithChunks :: (b -> SmallArray a -> Int -> b) -> b -> Vector a -> b
@@ -1250,8 +1333,13 @@ foldl1ViaNode f shift root tail_ =
       | otherwise = (error "pvector: no first elem", False)
 
 -- | O(n). Lazy right fold.
+-- Fuses with upstream producers when the input is in stream form.
 foldr :: (a -> b -> b) -> b -> Vector a -> b
-foldr f z0 v
+foldr = foldrDirect
+{-# INLINE foldr #-}
+
+foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
+foldrDirect f z0 v
   | vSize v == 0 = z0
   | otherwise    = goNode (vShift v) (vRoot v) (goArr (vTail v) 0 tailSz z0)
   where
@@ -1266,11 +1354,7 @@ foldr f z0 v
     goArr !arr !i !limit rest
       | i >= limit = rest
       | otherwise  = f (indexSmallArray arr i) (goArr arr (i + 1) limit rest)
-{-# INLINE foldr #-}
-
-foldrDirect :: (a -> b -> b) -> b -> Vector a -> b
-foldrDirect = foldr
-{-# INLINE foldrDirect #-}
+{-# INLINE [1] foldrDirect #-}
 
 -- | Lazy right fold, calling a chunk function for each SmallArray.
 foldrWithChunks :: (SmallArray a -> Int -> b -> b) -> Vector a -> b -> b
@@ -1297,7 +1381,7 @@ foldrArr f arr = go
 {-# INLINE foldrArr #-}
 
 foldr' :: (a -> b -> b) -> b -> Vector a -> b
-foldr' f z0 v = foldl' (\k x -> k . f x) id v z0
+foldr' f z0 v = foldlDirect (\k x -> k . f x) id v z0
 {-# INLINE foldr' #-}
 
 foldr1 :: (a -> a -> a) -> Vector a -> a
@@ -1368,7 +1452,7 @@ ifoldr f z0 v
 {-# INLINE ifoldr #-}
 
 foldMap :: Monoid m => (a -> m) -> Vector a -> m
-foldMap f = foldl' (\acc a -> acc <> f a) mempty
+foldMap f = foldlDirect (\acc a -> acc <> f a) mempty
 {-# INLINE foldMap #-}
 
 foldMap' :: Monoid m => (a -> m) -> Vector a -> m
@@ -1400,11 +1484,11 @@ or = any id
 {-# INLINE or #-}
 
 sum :: Num a => Vector a -> a
-sum = foldl' (+) 0
+sum = foldlDirect (+) 0
 {-# INLINE sum #-}
 
 product :: Num a => Vector a -> a
-product = foldl' (*) 1
+product = foldlDirect (*) 1
 {-# INLINE product #-}
 
 maximum :: Ord a => Vector a -> a
@@ -1532,7 +1616,7 @@ enumFromThenTo lo next hi
 ------------------------------------------------------------------------
 
 toList :: Vector a -> [a]
-toList v = build (\c n -> foldr c n v)
+toList v = build (\c n -> foldrDirect c n v)
 {-# INLINE toList #-}
 
 fromVector :: F.Foldable f => f a -> Vector a
@@ -1542,8 +1626,56 @@ fromVector = F.foldl' snoc empty
 reverse :: Vector a -> Vector a
 reverse v
   | n <= 1    = v
-  | otherwise = generate n (\i -> unsafeIndex v (n - 1 - i))
-  where !n = vSize v
+  | otherwise = create $ \mv -> do
+      buf <- newSmallArray bf uninitElem
+      let !tail_ = vTail v
+          !tailSz = sizeofSmallArray tail_
+      copyReversedArr buf 0 tail_ (tailSz - 1) tailSz
+      (buf', off') <- revNodeBuffered buf tailSz (vShift v) (vRoot v) mv
+      flushBuf buf' off' mv
+  where
+    !n = vSize v
+
+    copyReversedArr !dst !dstOff !src !srcIdx !count = do
+      let go !di !si !c
+            | c <= 0    = pure ()
+            | otherwise = do
+                writeSmallArray dst di (indexSmallArray src si)
+                go (di + 1) (si - 1) (c - 1)
+      go dstOff srcIdx count
+
+    revNodeBuffered !buf !off !_ Empty !_ = pure (buf, off)
+    revNodeBuffered !buf !off !_ (Leaf arr) !mv
+      | off == 0 = do
+          revArr <- reverseSmallArr arr bf
+          mPushChunk mv revArr
+          pure (buf, 0)
+      | otherwise = do
+          let !avail = bf - off
+          copyReversedArr buf off arr (bf - 1) avail
+          frozen <- unsafeFreezeSmallArray buf
+          mPushChunk mv frozen
+          newBuf <- newSmallArray bf uninitElem
+          let !remaining = off
+          copyReversedArr newBuf 0 arr (off - 1) remaining
+          pure (newBuf, remaining)
+    revNodeBuffered !buf !off !level (Internal arr) !mv = do
+      let go !b !o !i
+            | i < 0     = pure (b, o)
+            | otherwise = do
+                (b', o') <- revNodeBuffered b o (level - bfBits) (indexSmallArray arr i) mv
+                go b' o' (i - 1)
+      go buf off (bf - 1)
+
+    reverseSmallArr !src !len = do
+      marr <- newSmallArray len uninitElem
+      let go !i !j
+            | i >= len  = pure ()
+            | otherwise = do
+                writeSmallArray marr i (indexSmallArray src j)
+                go (i + 1) (j - 1)
+      go 0 (len - 1)
+      unsafeFreezeSmallArray marr
 {-# INLINE reverse #-}
 
 ------------------------------------------------------------------------
@@ -1655,40 +1787,411 @@ forArrI_ f = go
       | otherwise = f off (indexSmallArray arr i) >> go (off + 1) arr (i + 1) limit
 
 -- | Iterate over all elements via direct tree walk (no index).
+-- Tree walk is in the where clause so INLINE exposes it and the
+-- callback @f@ gets specialized at each call site.
 forEach_ :: Vector a -> (a -> ST s ()) -> ST s ()
 forEach_ v f
   | vSize v == 0 = pure ()
   | otherwise = do
-      forNode_ f (vShift v) (vRoot v)
-      forArr_ f (vTail v) 0 (sizeofSmallArray (vTail v))
-{-# INLINE forEach_ #-}
-
-{-# INLINEABLE forNode_ #-}
-forNode_ :: (a -> ST s ()) -> Int -> Node a -> ST s ()
-forNode_ _ _ Empty = pure ()
-forNode_ f _ (Leaf arr) = forArr_ f arr 0 bf
-forNode_ f level (Internal arr) = do
-  let go !i
-        | i >= bf = pure ()
-        | otherwise = forNode_ f (level - bfBits) (indexSmallArray arr i) >> go (i + 1)
-  go 0
-
-{-# INLINEABLE forArr_ #-}
-forArr_ :: (a -> ST s ()) -> SmallArray a -> Int -> Int -> ST s ()
-forArr_ f arr = go
+      goNode (vShift v) (vRoot v)
+      goArr (vTail v) 0 (sizeofSmallArray (vTail v))
   where
-    go !i !limit
+    goNode !_ Empty = pure ()
+    goNode !_ (Leaf arr) = goArr arr 0 bf
+    goNode !level (Internal arr) = do
+      let go !i
+            | i >= bf = pure ()
+            | otherwise = goNode (level - bfBits) (indexSmallArray arr i) >> go (i + 1)
+      go 0
+
+    goArr !arr !i !limit
       | i >= limit = pure ()
-      | otherwise = f (indexSmallArray arr i) >> go (i + 1) limit
+      | otherwise = f (indexSmallArray arr i) >> goArr arr (i + 1) limit
+{-# INLINE forEach_ #-}
 
 append :: Vector a -> Vector a -> Vector a
 append v1 v2
   | null v1   = v2
   | null v2   = v1
-  | otherwise = create $ \mv -> do
-      forEach_ v1 (mPush mv)
-      forEach_ v2 (mPush mv)
+  | sizeofSmallArray (vTail v1) == bf = appendAligned v1 v2
+  | otherwise = appendGraft v1 v2
 {-# INLINE append #-}
+
+-- | Append when v1's tail is exactly bf elements (aligned boundary).
+-- Flushes v1's tail into its tree, then grafts v2's tree as a sibling.
+appendAligned :: Vector a -> Vector a -> Vector a
+appendAligned v1 v2 =
+  let !n = vSize v1 + vSize v2
+      !(s1, r1) = flushTailPure (vSize v1) (vShift v1) (vRoot v1) (vTail v1)
+  in case vRoot v2 of
+    Empty -> Vector n s1 r1 (vTail v2)
+    _     -> let !(rs, rr) = graftRight s1 r1 (vShift v2) (vRoot v2)
+             in Vector n rs rr (vTail v2)
+
+-- | Flush a full tail into the tree (pure, persistent path).
+flushTailPure :: Int -> Int -> Node a -> SmallArray a -> (Int, Node a)
+flushTailPure n shift root tailArr
+  | willOverflow =
+      let !arr = runST $ do
+            a <- newSmallArray bf Empty
+            writeSmallArray a 0 root
+            writeSmallArray a 1 (newPath shift (Leaf tailArr))
+            unsafeFreezeSmallArray a
+      in (shift + bfBits, Internal arr)
+  | otherwise =
+      (shift, pushTail n shift root tailArr)
+  where !willOverflow = unsafeShiftR n bfBits > unsafeShiftL 1 shift
+
+-- | Graft rightTree as the next subtree after leftTree.
+-- If shifts match, creates a new root one level up.
+-- If leftTree is deeper, inserts rightTree into leftTree's first available slot.
+graftRight :: Int -> Node a -> Int -> Node a -> (Int, Node a)
+graftRight s1 r1 s2 r2
+  | s1 == s2 =
+      (s1 + bfBits, Internal $ runST $ do
+        a <- newSmallArray bf Empty
+        writeSmallArray a 0 r1
+        writeSmallArray a 1 r2
+        unsafeFreezeSmallArray a)
+  | s1 > s2 =
+      case r1 of
+        Internal arr ->
+          let !slot = firstEmptySlot arr 0
+          in if slot < bf
+             then let !lifted = liftToShift (s1 - bfBits) s2 r2
+                  in (s1, Internal (cloneAndSet arr slot lifted))
+             else (s1 + bfBits, Internal $ runST $ do
+                     a <- newSmallArray bf Empty
+                     writeSmallArray a 0 r1
+                     writeSmallArray a 1 (liftToShift s1 s2 r2)
+                     unsafeFreezeSmallArray a)
+        _ -> (s1 + bfBits, Internal $ runST $ do
+                a <- newSmallArray bf Empty
+                writeSmallArray a 0 r1
+                writeSmallArray a 1 (liftToShift s1 s2 r2)
+                unsafeFreezeSmallArray a)
+  | otherwise =
+      graftRight s2 (liftToShift s2 s1 r1) s2 r2
+
+-- | Wrap a node in newPath calls to raise it to a target shift level.
+liftToShift :: Int -> Int -> Node a -> Node a
+liftToShift targetShift currentShift node
+  | currentShift >= targetShift = node
+  | otherwise = liftToShift targetShift (currentShift + bfBits) $
+      Internal $ runST $ do
+        a <- newSmallArray bf Empty
+        writeSmallArray a 0 node
+        unsafeFreezeSmallArray a
+
+-- | Find the first Empty slot in an Internal node's children.
+firstEmptySlot :: SmallArray (Node a) -> Int -> Int
+firstEmptySlot arr !i
+  | i >= bf = bf
+  | otherwise = case indexSmallArray arr i of
+      Empty -> i
+      _     -> firstEmptySlot arr (i + 1)
+
+-- | Append with misaligned boundary: graft v1's root directly into the
+-- result tree, create a merged leaf at the boundary, and rechunk the
+-- remaining v2 elements into a second subtree. No mPush/mPushChunk overhead.
+appendGraft :: Vector a -> Vector a -> Vector a
+appendGraft v1 v2
+  | vSize v2 + sizeofSmallArray (vTail v1) <= bf =
+      -- v1's tail + all of v2 fit in a single tail (no new tree leaf needed)
+      let !n = vSize v1 + vSize v2
+          !k1 = sizeofSmallArray (vTail v1)
+          !newTail = runST $ do
+            marr <- newSmallArray n' uninitElem
+            copySmallArray marr 0 (vTail v1) 0 k1
+            copyFromVectorPure marr k1 (vSize v2) v2 0
+            unsafeFreezeSmallArray marr
+          !n' = k1 + vSize v2
+      in Vector n (vShift v1) (vRoot v1) newTail
+  | otherwise = appendGraftFull v1 v2
+  where
+    copyFromVectorPure !dst !dstOff !count !v !vOff = do
+      let !toff = tailOffset (vSize v)
+          go !d !src !remaining
+            | remaining <= 0 = pure ()
+            | src >= toff = do
+                let !tailOff = src - toff
+                    !avail = sizeofSmallArray (vTail v) - tailOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d (vTail v) tailOff toCopy
+            | otherwise = do
+                let !arr = leafFor (vShift v) src (vRoot v)
+                    !leafOff = src .&. bfMask
+                    !avail = bf - leafOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d arr leafOff toCopy
+                go (d + toCopy) (src + toCopy) (remaining - toCopy)
+      go dstOff vOff count
+
+appendGraftFull :: Vector a -> Vector a -> Vector a
+appendGraftFull v1 v2 = runST $ do
+  let !n = vSize v1 + vSize v2
+      !k1 = sizeofSmallArray (vTail v1)
+      !need = bf - k1
+
+  -- Build merged leaf: v1's tail + first `need` elements from v2
+  mergedLeaf <- do
+    marr <- newSmallArray bf uninitElem
+    copySmallArray marr 0 (vTail v1) 0 k1
+    let !toff2 = tailOffset (vSize v2)
+    if toff2 > 0
+      then do
+        let !arr = leafFor (vShift v2) 0 (vRoot v2)
+        copySmallArray marr k1 arr 0 need
+      else
+        copySmallArray marr k1 (vTail v2) 0 need
+    Leaf <$> unsafeFreezeSmallArray marr
+
+  -- Build child0: v1's root with merged leaf in the next available slot
+  let !child0 = case vRoot v1 of
+        Empty -> Internal $ runST $ do
+          a <- newSmallArray bf Empty
+          writeSmallArray a 0 mergedLeaf
+          unsafeFreezeSmallArray a
+        Internal arr ->
+          let !slot = firstEmptySlot arr 0
+          in Internal (cloneAndSet arr slot mergedLeaf)
+        _ -> error "pvector: appendGraft invariant"
+
+  -- Rechunk remaining v2 elements (starting at offset `need` into v2)
+  -- into a second subtree + result tail.
+  -- Remaining = n2 - need elements from v2.
+  let !remaining = vSize v2 - need
+  if remaining <= 0
+    then
+      -- All of v2 fit in the merged leaf. Result tail is empty-ish.
+      pure (Vector n (vShift v1) child0 emptyTail)
+    else do
+      -- Collect rechunked leaves from v2 (starting at offset `need`)
+      -- and build child1 + result tail.
+      buf <- newSmallArray bf uninitElem
+      -- leafBuf collects full rechunked leaves
+      leafBuf <- newSmallArray bf (undefined :: SmallArray a)
+      let !v2s = vShift v2
+          !v2r = vRoot v2
+          !v2t = vTail v2
+          !v2ts = sizeofSmallArray v2t
+
+      (!nRechunked, !buf', !bufOff') <- rechunkFrom buf 0 leafBuf 0 need v2s v2r v2t v2ts
+
+      -- Build result tail from remaining buffer
+      frozenTail <- if bufOff' > 0
+        then do
+          rt <- newSmallArray bufOff' uninitElem
+          copySmallMutableArray rt 0 buf' 0 bufOff'
+          unsafeFreezeSmallArray rt
+        else pure emptyTail
+
+      -- Build child1 from rechunked leaves
+      child1 <- if nRechunked > 0
+        then do
+          c1arr <- newSmallArray bf Empty
+          let go !i
+                | i >= nRechunked = pure ()
+                | otherwise = do
+                    la <- readSmallArray leafBuf i
+                    writeSmallArray c1arr i (Leaf la)
+                    go (i + 1)
+          go 0
+          Internal <$> unsafeFreezeSmallArray c1arr
+        else pure Empty
+
+      -- Compute result shift and root
+      let !s1 = vShift v1
+          !(rs, rr) = case child1 of
+            Empty -> (s1, child0)
+            _     -> graftRight s1 child0 s1 child1
+
+      pure (Vector n rs rr frozenTail)
+  where
+    -- Copy `count` elements from a vector starting at element offset `vOff`
+    -- into a mutable array at `dstOff`.
+    copyFromVector :: SmallMutableArray s a -> Int -> Int -> Vector a -> Int -> ST s ()
+    copyFromVector !dst !dstOff !count !v !vOff = do
+      let !toff = tailOffset (vSize v)
+          !shift = vShift v
+          !root = vRoot v
+          !tail_ = vTail v
+          go !d !src !remaining
+            | remaining <= 0 = pure ()
+            | src >= toff = do
+                let !tailOff = src - toff
+                    !avail = sizeofSmallArray tail_ - tailOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d tail_ tailOff toCopy
+            | otherwise = do
+                let !arr = leafFor shift src root
+                    !leafOff = src .&. bfMask
+                    !avail = bf - leafOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d arr leafOff toCopy
+                go (d + toCopy) (src + toCopy) (remaining - toCopy)
+      go dstOff vOff count
+
+    -- Rechunk v2 elements starting at offset `skip` into full 32-element chunks.
+    -- Walks v2's tree leaves and tail, shifting by `skip`.
+    rechunkFrom :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> Int -> Int -> Node a -> SmallArray a -> Int
+                -> ST s (Int, SmallMutableArray s a, Int)
+    rechunkFrom !buf !bufOff !leafBuf !leafIdx !skip !v2Shift !v2Root !v2Tail !v2TailSz = do
+      (buf1, bo1, li1) <- rechunkNode buf bufOff leafBuf leafIdx skip v2Shift v2Root
+      let !treeElems = treeSize v2Shift v2Root
+          !tailSkip = max 0 (skip - treeElems)
+          !tailOff = tailSkip
+          !tailLen = v2TailSz - tailOff
+      if tailLen > 0
+        then do
+          (b, o, l) <- rechunkCopy buf1 bo1 leafBuf li1 v2Tail tailOff tailLen
+          pure (l, b, o)
+        else pure (li1, buf1, bo1)
+
+    treeSize :: Int -> Node a -> Int
+    treeSize _ Empty = 0
+    treeSize _ (Leaf _) = bf
+    treeSize shift (Internal arr) =
+      let !n = countNonEmpty arr
+      in n * (unsafeShiftL 1 shift)
+
+    countNonEmpty :: SmallArray (Node a) -> Int
+    countNonEmpty arr = go 0 0
+      where go !i !c
+              | i >= sizeofSmallArray arr = c
+              | otherwise = case indexSmallArray arr i of
+                  Empty -> go (i + 1) c
+                  _     -> go (i + 1) (c + 1)
+
+    rechunkNode :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> Int -> Int -> Node a
+                -> ST s (SmallMutableArray s a, Int, Int)
+    rechunkNode !buf !bo !lb !li !skip !_ Empty = pure (buf, bo, li)
+    rechunkNode !buf !bo !lb !li !skip !_ (Leaf arr)
+      | skip >= bf = pure (buf, bo, li)
+      | otherwise = rechunkCopy buf bo lb li arr skip (bf - skip)
+    rechunkNode !buf !bo !lb !li !skip !level (Internal arr) = do
+      let !childSize = unsafeShiftL 1 level
+          go !b !o !l !sk !i
+            | i >= bf = pure (b, o, l)
+            | sk >= childSize = go b o l (sk - childSize) (i + 1)
+            | otherwise = do
+                (b', o', l') <- rechunkNode b o lb l sk (level - bfBits) (indexSmallArray arr i)
+                go b' o' l' 0 (i + 1)
+      go buf bo li skip 0
+
+    rechunkCopy :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> SmallArray a -> Int -> Int
+                -> ST s (SmallMutableArray s a, Int, Int)
+    rechunkCopy !buf !bo !lb !li !src !srcOff !srcLen = go buf bo li srcOff srcLen
+      where
+        go !b !o !l !so !sl
+          | sl <= 0 = pure (b, o, l)
+          | otherwise = do
+              let !avail = bf - o
+                  !toCopy = min sl avail
+              copySmallArray b o src so toCopy
+              let !newO = o + toCopy
+              if newO >= bf
+                then do
+                  frozen <- unsafeFreezeSmallArray b
+                  writeSmallArray lb l frozen
+                  newBuf <- newSmallArray bf uninitElem
+                  go newBuf 0 (l + 1) (so + toCopy) (sl - toCopy)
+                else
+                  pure (b, newO, l)
+
+appendChunked :: MVector s a -> Vector a -> Vector a -> ST s ()
+appendChunked mv v1 v2 = do
+  pushNodeChunks (vShift v1) (vRoot v1) mv
+  let !k = sizeofSmallArray (vTail v1)
+  if k == bf
+    then do
+      mPushChunk mv (vTail v1)
+      pushNodeChunks (vShift v2) (vRoot v2) mv
+      pushTailElems (vTail v2) (sizeofSmallArray (vTail v2)) mv
+    else do
+      buf <- newSmallArray bf uninitElem
+      copySmallArray buf 0 (vTail v1) 0 k
+      (buf', off') <- pushNodeBuffered buf k (vShift v2) (vRoot v2) mv
+      (buf'', off'') <- copyBuffered buf' off' (vTail v2) 0 (sizeofSmallArray (vTail v2)) mv
+      flushBuf buf'' off'' mv
+{-# INLINE appendChunked #-}
+
+pushNodeChunks :: Int -> Node a -> MVector s a -> ST s ()
+pushNodeChunks !_ Empty !_ = pure ()
+pushNodeChunks !_ (Leaf arr) !mv = mPushChunk mv arr
+pushNodeChunks !level (Internal arr) !mv = do
+  let go !i
+        | i >= bf = pure ()
+        | otherwise = pushNodeChunks (level - bfBits) (indexSmallArray arr i) mv >> go (i + 1)
+  go 0
+{-# INLINEABLE pushNodeChunks #-}
+
+pushNodeBuffered :: SmallMutableArray s a -> Int -> Int -> Node a -> MVector s a
+                 -> ST s (SmallMutableArray s a, Int)
+pushNodeBuffered !buf !off !_ Empty !_ = pure (buf, off)
+pushNodeBuffered !buf !off !_ (Leaf arr) !mv
+  | off == 0 = do
+      mPushChunk mv arr
+      pure (buf, 0)
+  | otherwise = copyBuffered buf off arr 0 bf mv
+pushNodeBuffered !buf !off !level (Internal arr) !mv = do
+  let go !b !o !i
+        | i >= bf = pure (b, o)
+        | otherwise = do
+            (b', o') <- pushNodeBuffered b o (level - bfBits) (indexSmallArray arr i) mv
+            go b' o' (i + 1)
+  go buf off 0
+{-# INLINEABLE pushNodeBuffered #-}
+
+copyBuffered :: SmallMutableArray s a -> Int -> SmallArray a -> Int -> Int -> MVector s a
+             -> ST s (SmallMutableArray s a, Int)
+copyBuffered !buf !bufOff !src !srcOff !srcLen !mv = go buf bufOff srcOff srcLen
+  where
+    go !b !bo !so !sl
+      | sl <= 0 = pure (b, bo)
+      | otherwise = do
+          let !avail = bf - bo
+              !toCopy = min sl avail
+          copySmallArray b bo src so toCopy
+          let !newBo = bo + toCopy
+          if newBo >= bf
+            then do
+              frozen <- unsafeFreezeSmallArray b
+              mPushChunk mv frozen
+              newBuf <- newSmallArray bf uninitElem
+              go newBuf 0 (so + toCopy) (sl - toCopy)
+            else
+              pure (b, newBo)
+{-# INLINEABLE copyBuffered #-}
+
+flushBuf :: SmallMutableArray s a -> Int -> MVector s a -> ST s ()
+flushBuf !buf !off !mv = go 0
+  where
+    go !i
+      | i >= off = pure ()
+      | otherwise = do
+          x <- readSmallArray buf i
+          mPush mv x
+          go (i + 1)
+{-# INLINE flushBuf #-}
+
+pushTailElems :: SmallArray a -> Int -> MVector s a -> ST s ()
+pushTailElems !arr !len !mv = go 0
+  where
+    go !i
+      | i >= len  = pure ()
+      | otherwise = mPush mv (indexSmallArray arr i) >> go (i + 1)
+{-# INLINE pushTailElems #-}
+
+uninitElem :: a
+uninitElem = error "pvector: uninitialised element"
+{-# NOINLINE uninitElem #-}
 
 ------------------------------------------------------------------------
 -- Transient (mutable) operations
@@ -1710,7 +2213,8 @@ modify act v = runST $ do
 
 thaw :: PrimMonad m => Vector a -> m (MVector (PrimState m) a)
 thaw v = do
-  mtail <- thawSmallArray (vTail v) 0 tailSz
+  mtail <- newSmallArray bf undefinedElem'
+  copySmallArray mtail 0 (vTail v) 0 tailSz
   ref <- newMutVar $! MVState
     { mvSize     = vSize v
     , mvShift    = vShift v
@@ -1721,6 +2225,7 @@ thaw v = do
   pure (MVector ref)
   where
     !tailSz = sizeofSmallArray (vTail v)
+    undefinedElem' = error "pvector: uninitialised element"
 {-# INLINE thaw #-}
 
 freeze :: PrimMonad m => MVector (PrimState m) a -> m (Vector a)
@@ -1736,9 +2241,7 @@ unsafeFreeze mv = do
         | sizeofSmallArray frozenTail > mvTailSize st
           = cloneSmallArray frozenTail 0 (mvTailSize st)
         | otherwise = frozenTail
-      !frozenRoot = case frozenRoot0 of
-        Empty -> emptyRoot
-        _     -> frozenRoot0
+      !frozenRoot = frozenRoot0
   pure $! Vector (mvSize st) (mvShift st) frozenRoot tail_
 {-# INLINE unsafeFreeze #-}
 
@@ -2109,6 +2612,10 @@ liftSmap f (MStream step s0) = MStream step' s0
 
 -- === Core fusion and recycling rules ===
 
+-- Short-circuit stream/unstream roundtrip (like vector's "stream/unstream")
+"pvector/stream/unstream"
+  forall s. stream (unstream s) = s
+
 -- Eliminates stream→new→fill→stream roundtrip
 "pvector/fusion"
   forall s. stream (new (fill s)) = s
@@ -2142,28 +2649,51 @@ liftSmap f (MStream step s0) = MStream step' s0
 "pvector/uninplace/map" forall f p.
   stream (new (mapNew f p)) = S.smap f (stream (new p))
 
--- Specialise map to inplace_map when the type allows (a -> a)
-"pvector/map/inplace" map = inplace_map
-
 -- === Stream forwarding: expose stream form for cross-operation fusion ===
+-- Phase [~1] fires early so the stream form is visible for composition.
 "pvector/map [stream]" [~1] forall f v.
   map f v = unstream (S.smap f (stream v))
 "pvector/filter [stream]" [~1] forall f v.
   filter f v = unstream (S.sfilter f (stream v))
-"pvector/foldl' [stream]" [~1] forall f z v.
-  foldl' f z v = S.sfoldl' f z (stream v)
-"pvector/foldr [stream]" [~1] forall f z v.
-  foldr f z v = S.sfoldr f z (stream v)
+"pvector/take [stream]" [~1] forall n v.
+  take n v = unstream (S.stake n (stream v))
+"pvector/drop [stream]" [~1] forall n v.
+  drop n v = unstream (S.sdrop n (stream v))
+"pvector/takeWhile [stream]" [~1] forall p v.
+  takeWhile p v = unstream (S.stakeWhile p (stream v))
+"pvector/dropWhile [stream]" [~1] forall p v.
+  dropWhile p v = unstream (S.sdropWhile p (stream v))
+"pvector/zipWith [stream]" [~1] forall f v1 v2.
+  zipWith f v1 v2 = unstream (S.szipWith f (stream v1) (stream v2))
+"pvector/mapMaybe [stream]" [~1] forall f v.
+  mapMaybe f v = unstream (S.smapMaybe f (stream v))
+-- === Consumer fusion: fuse folds when the input is already in stream form ===
+-- These match foldlDirect/foldrDirect (which foldl'/foldr inline to)
+-- applied to (unstream s). The stream/unstream roundtrip is eliminated,
+-- and the fold consumes the stream directly in a single fused loop.
+"pvector/foldlDirect/unstream" forall f z s.
+  foldlDirect f z (unstream s) = S.sfoldl' f z s
+"pvector/foldrDirect/unstream" forall f z s.
+  foldrDirect f z (unstream s) = S.sfoldr f z s
 
 -- === Fallback rules: revert to direct implementations when not fused ===
+-- Phase [1] fires late so only standalone (unfused) operations match.
 "pvector/map [direct]" [1] forall f v.
   unstream (S.smap f (stream v)) = mapDirect f v
 "pvector/filter [direct]" [1] forall f v.
   unstream (S.sfilter f (stream v)) = filterDirect f v
-"pvector/foldl' [direct]" [1] forall f z v.
-  S.sfoldl' f z (stream v) = foldlDirect f z v
-"pvector/foldr [direct]" [1] forall f z v.
-  S.sfoldr f z (stream v) = foldrDirect f z v
+"pvector/take [direct]" [1] forall n v.
+  unstream (S.stake n (stream v)) = takeDirect n v
+"pvector/drop [direct]" [1] forall n v.
+  unstream (S.sdrop n (stream v)) = dropDirect n v
+"pvector/takeWhile [direct]" [1] forall p v.
+  unstream (S.stakeWhile p (stream v)) = takeWhileDirect p v
+"pvector/dropWhile [direct]" [1] forall p v.
+  unstream (S.sdropWhile p (stream v)) = dropWhileDirect p v
+"pvector/zipWith [direct]" [1] forall f v1 v2.
+  unstream (S.szipWith f (stream v1) (stream v2)) = zipWithDirect f v1 v2
+"pvector/mapMaybe [direct]" [1] forall f v.
+  unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
 
   #-}
 
@@ -2225,6 +2755,7 @@ newPath level node =
 pushTail :: Int -> Int -> Node a -> SmallArray a -> Node a
 pushTail size shift root tailArr = go shift root
   where
+    go _ Empty = newPath shift (Leaf tailArr)
     go level (Internal arr) =
       let !subIdx = indexAtLevel (size - 1) level
       in if level == bfBits

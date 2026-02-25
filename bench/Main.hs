@@ -205,6 +205,47 @@ main = defaultMain
       ]
     | n <- sizes
     ]
+  , bgroup "foldl' . map (fused)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, _sq) ->
+      bgroup (show n)
+      [ bench "Vector"  $ nf (V.foldl' (+) (0 :: Int) . V.map (+1)) vec
+      , bench "PVector" $ nf (P.foldl' (+) (0 :: Int) . P.map (+1)) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "foldl' . filter (fused)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, _sq) ->
+      bgroup (show n)
+      [ bench "Vector"  $ nf (V.foldl' (+) (0 :: Int) . V.filter even) vec
+      , bench "PVector" $ nf (P.foldl' (+) (0 :: Int) . P.filter even) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "map . map (fused)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, _sq) ->
+      bgroup (show n)
+      [ bench "Vector"  $ nf (V.map (+2) . V.map (+1)) vec
+      , bench "PVector" $ nf (P.map (+2) . P.map (+1)) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "foldl' . map . filter (fused)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, _sq) ->
+      bgroup (show n)
+      [ bench "Vector"  $ nf (V.foldl' (+) (0::Int) . V.map (+1) . V.filter even) vec
+      , bench "PVector" $ nf (P.foldl' (+) (0::Int) . P.map (+1) . P.filter even) pvec
+      ]
+    | n <- sizes
+    ]
+  , bgroup "foldl' . take (fused)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, _sq) ->
+      let !h = n `div` 2 in
+      bgroup (show n)
+      [ bench "Vector"  $ nf (V.foldl' (+) (0::Int) . V.take h) vec
+      , bench "PVector" $ nf (P.foldl' (+) (0::Int) . P.take h) pvec
+      ]
+    | n <- sizes
+    ]
   ]
 
 foldSmallArray :: (b -> a -> b) -> b -> SmallArray a -> b
