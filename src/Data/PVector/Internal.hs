@@ -24,9 +24,11 @@ module Data.PVector.Internal
   , emptyRoot
   , emptyTail
   , snocArray
+  , consArray
   , unsnocArray
   , cloneAndSet
   , rnfArray
+  , mapArray'
   ) where
 
 import Control.DeepSeq (NFData(..))
@@ -35,29 +37,24 @@ import Control.Monad.ST
 import Data.Bits
 import Data.Primitive.SmallArray
 
--- | Bits per level of the trie. 5 bits = branching factor of 32.
 bfBits :: Int
 bfBits = 5
 {-# INLINE bfBits #-}
 
--- | Branching factor (32).
 bf :: Int
 bf = 32
 {-# INLINE bf #-}
 
--- | Mask for extracting the index within a level.
 bfMask :: Int
 bfMask = 31
 {-# INLINE bfMask #-}
 
--- | Compute the index of the first element in the tail.
 tailOffset :: Int -> Int
 tailOffset n
   | n < bf    = 0
   | otherwise = unsafeShiftL (unsafeShiftR (n - 1) bfBits) bfBits
 {-# INLINE tailOffset #-}
 
--- | Extract the sub-index at a given bit level.
 indexAtLevel :: Int -> Int -> Int
 indexAtLevel i level = unsafeShiftR i level .&. bfMask
 {-# INLINE indexAtLevel #-}
@@ -85,19 +82,15 @@ instance NFData a => NFData (Node a) where
 -- Mutable (transient) node
 ------------------------------------------------------------------------
 
--- | A mutable trie node. 'Frozen' wraps a persistent node that has not
--- yet been cloned; mutation will clone it on demand (copy-on-write).
 data MNode s a
   = MInternal {-# UNPACK #-} !(SmallMutableArray s (MNode s a))
   | MLeaf     {-# UNPACK #-} !(SmallMutableArray s a)
   | Frozen    !(Node a)
 
--- | Convert a persistent node to a mutable wrapper without copying.
 thawNode :: Node a -> MNode s a
 thawNode = Frozen
 {-# INLINE thawNode #-}
 
--- | Recursively freeze a mutable node tree into a persistent tree.
 freezeNode :: PrimMonad m => MNode (PrimState m) a -> m (Node a)
 freezeNode (Frozen node) = pure node
 freezeNode (MLeaf marr)  = Leaf <$> unsafeFreezeSmallArray marr
@@ -116,7 +109,6 @@ freezeNode (MInternal marr) = do
   Internal <$> unsafeFreezeSmallArray buf
 {-# INLINABLE freezeNode #-}
 
--- | Obtain a mutable internal array, cloning a frozen one if necessary.
 editableInternal
   :: PrimMonad m
   => MNode (PrimState m) a
@@ -136,7 +128,6 @@ editableInternal (Frozen Empty) = newSmallArray bf (Frozen Empty)
 editableInternal _ = error "pvector: editableInternal on leaf node"
 {-# INLINABLE editableInternal #-}
 
--- | Obtain a mutable leaf array, cloning a frozen one if necessary.
 editableLeaf
   :: PrimMonad m
   => MNode (PrimState m) a
@@ -150,19 +141,16 @@ editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 -- Array helpers
 ------------------------------------------------------------------------
 
--- | An empty root node (Internal with bf Empty children).
 emptyRoot :: Node a
 emptyRoot = Internal $ runST $ do
   arr <- newSmallArray bf Empty
   unsafeFreezeSmallArray arr
 {-# NOINLINE emptyRoot #-}
 
--- | An empty, zero-length SmallArray.
 emptyTail :: SmallArray a
 emptyTail = runSmallArray (newSmallArray 0 undefinedElem)
 {-# NOINLINE emptyTail #-}
 
--- | Append an element to the end of an immutable array.
 snocArray :: SmallArray a -> a -> SmallArray a
 snocArray arr x = runST $ do
   let !n = sizeofSmallArray arr
@@ -171,7 +159,14 @@ snocArray arr x = runST $ do
   unsafeFreezeSmallArray marr
 {-# INLINE snocArray #-}
 
--- | Remove the last element, returning the shortened array and the element.
+consArray :: a -> SmallArray a -> SmallArray a
+consArray x arr = runST $ do
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray (n + 1) x
+  copySmallArray marr 1 arr 0 n
+  unsafeFreezeSmallArray marr
+{-# INLINE consArray #-}
+
 unsnocArray :: SmallArray a -> (SmallArray a, a)
 unsnocArray arr =
   let !n  = sizeofSmallArray arr
@@ -180,7 +175,6 @@ unsnocArray arr =
   in (a', x)
 {-# INLINE unsnocArray #-}
 
--- | Clone an immutable array and set one slot.
 cloneAndSet :: SmallArray a -> Int -> a -> SmallArray a
 cloneAndSet arr i x = runST $ do
   marr <- thawSmallArray arr 0 (sizeofSmallArray arr)
@@ -188,7 +182,21 @@ cloneAndSet arr i x = runST $ do
   unsafeFreezeSmallArray marr
 {-# INLINE cloneAndSet #-}
 
--- | Deeply evaluate every element of a SmallArray.
+-- | Strict map over a SmallArray, producing a new array.
+mapArray' :: (a -> b) -> SmallArray a -> SmallArray b
+mapArray' f arr = runST $ do
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n undefinedElem
+  let go i
+        | i >= n = pure ()
+        | otherwise = do
+            let !x = f (indexSmallArray arr i)
+            writeSmallArray marr i x
+            go (i + 1)
+  go 0
+  unsafeFreezeSmallArray marr
+{-# INLINE mapArray' #-}
+
 rnfArray :: NFData a => SmallArray a -> ()
 rnfArray arr = go 0
   where
