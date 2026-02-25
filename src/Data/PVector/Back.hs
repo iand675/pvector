@@ -607,16 +607,37 @@ snoc v x
 (<|) = cons
 {-# INLINE (<|) #-}
 
--- | O(n+m). Concatenate. Fuses: @(a ++ b) ++ c@ eliminates intermediate.
+-- | O(n+m). Concatenate.
 (++) :: Vector a -> Vector a -> Vector a
-v1 ++ v2 = unstream (S.sconcat (stream v1) (stream v2))
+(++) = append
 {-# INLINE (++) #-}
 
 concat :: [Vector a] -> Vector a
-concat vs = create $ \mv ->
-  let go []     = pure ()
-      go (v:vs') = forEach_ v (mPush mv) >> go vs'
-  in go vs
+concat [] = empty
+concat [v] = v
+concat vs = create $ \mv -> do
+  buf <- newSmallArray bf uninitElem
+  let go !b !off [] = flushBuf b off mv
+      go !b !off (v:vs')
+        | vSize v == 0 = go b off vs'
+        | off == 0 = do
+            pushNodeChunks (vShift v) (vRoot v) mv
+            let !tail_ = vTail v
+                !k = sizeofSmallArray tail_
+            if k == bf
+              then do
+                mPushChunk mv tail_
+                go b 0 vs'
+              else do
+                copySmallArray b 0 tail_ 0 k
+                go b k vs'
+        | otherwise = do
+            (b', off') <- pushNodeBuffered b off (vShift v) (vRoot v) mv
+            let !tail_ = vTail v
+                !tailSz = sizeofSmallArray tail_
+            (b'', off'') <- copyBuffered b' off' tail_ 0 tailSz mv
+            go b'' off'' vs'
+  go buf 0 vs
 {-# INLINE concat #-}
 
 -- | Fully evaluate the vector and its elements.
@@ -1282,8 +1303,6 @@ foldl1ViaNode f shift root tail_ =
       | otherwise = (error "pvector: no first elem", False)
 
 -- | O(n). Lazy right fold.
--- Tree walk and leaf fold are in the where clause so INLINE
--- exposes everything to the call site for specialization.
 foldr :: (a -> b -> b) -> b -> Vector a -> b
 foldr f z0 v
   | vSize v == 0 = z0
@@ -1291,15 +1310,12 @@ foldr f z0 v
   where
     !tailSz = sizeofSmallArray (vTail v)
     goNode !_ Empty rest = rest
-    goNode !_ (Leaf arr) rest = goChunk arr 0 rest
+    goNode !_ (Leaf arr) rest = foldrChunk32 f arr rest
     goNode !level (Internal arr) rest =
       let goC !i !r
             | i < 0     = r
             | otherwise = goC (i - 1) (goNode (level - bfBits) (indexSmallArray arr i) r)
       in goC (bf - 1) rest
-    goChunk !arr !i rest
-      | i >= 32   = rest
-      | otherwise = f (indexSmallArray arr i) (goChunk arr (i + 1) rest)
     goArr !arr !i !limit rest
       | i >= limit = rest
       | otherwise  = f (indexSmallArray arr i) (goArr arr (i + 1) limit rest)
@@ -1733,11 +1749,96 @@ append :: Vector a -> Vector a -> Vector a
 append v1 v2
   | null v1   = v2
   | null v2   = v1
-  | otherwise = runST $ do
-      mv <- thaw v1
-      forEach_ v2 (mPush mv)
-      unsafeFreeze mv
+  | otherwise = create $ \mv -> appendChunked mv v1 v2
 {-# INLINE append #-}
+
+appendChunked :: MVector s a -> Vector a -> Vector a -> ST s ()
+appendChunked mv v1 v2 = do
+  pushNodeChunks (vShift v1) (vRoot v1) mv
+  let !k = sizeofSmallArray (vTail v1)
+  if k == bf
+    then do
+      mPushChunk mv (vTail v1)
+      pushNodeChunks (vShift v2) (vRoot v2) mv
+      pushTailElems (vTail v2) (sizeofSmallArray (vTail v2)) mv
+    else do
+      buf <- newSmallArray bf uninitElem
+      copySmallArray buf 0 (vTail v1) 0 k
+      (buf', off') <- pushNodeBuffered buf k (vShift v2) (vRoot v2) mv
+      (buf'', off'') <- copyBuffered buf' off' (vTail v2) 0 (sizeofSmallArray (vTail v2)) mv
+      flushBuf buf'' off'' mv
+{-# INLINE appendChunked #-}
+
+pushNodeChunks :: Int -> Node a -> MVector s a -> ST s ()
+pushNodeChunks !_ Empty !_ = pure ()
+pushNodeChunks !_ (Leaf arr) !mv = mPushChunk mv arr
+pushNodeChunks !level (Internal arr) !mv = do
+  let go !i
+        | i >= bf = pure ()
+        | otherwise = pushNodeChunks (level - bfBits) (indexSmallArray arr i) mv >> go (i + 1)
+  go 0
+{-# INLINEABLE pushNodeChunks #-}
+
+pushNodeBuffered :: SmallMutableArray s a -> Int -> Int -> Node a -> MVector s a
+                 -> ST s (SmallMutableArray s a, Int)
+pushNodeBuffered !buf !off !_ Empty !_ = pure (buf, off)
+pushNodeBuffered !buf !off !_ (Leaf arr) !mv
+  | off == 0 = do
+      mPushChunk mv arr
+      pure (buf, 0)
+  | otherwise = copyBuffered buf off arr 0 bf mv
+pushNodeBuffered !buf !off !level (Internal arr) !mv = do
+  let go !b !o !i
+        | i >= bf = pure (b, o)
+        | otherwise = do
+            (b', o') <- pushNodeBuffered b o (level - bfBits) (indexSmallArray arr i) mv
+            go b' o' (i + 1)
+  go buf off 0
+{-# INLINEABLE pushNodeBuffered #-}
+
+copyBuffered :: SmallMutableArray s a -> Int -> SmallArray a -> Int -> Int -> MVector s a
+             -> ST s (SmallMutableArray s a, Int)
+copyBuffered !buf !bufOff !src !srcOff !srcLen !mv = go buf bufOff srcOff srcLen
+  where
+    go !b !bo !so !sl
+      | sl <= 0 = pure (b, bo)
+      | otherwise = do
+          let !avail = bf - bo
+              !toCopy = min sl avail
+          copySmallArray b bo src so toCopy
+          let !newBo = bo + toCopy
+          if newBo >= bf
+            then do
+              frozen <- unsafeFreezeSmallArray b
+              mPushChunk mv frozen
+              newBuf <- newSmallArray bf uninitElem
+              go newBuf 0 (so + toCopy) (sl - toCopy)
+            else
+              pure (b, newBo)
+{-# INLINEABLE copyBuffered #-}
+
+flushBuf :: SmallMutableArray s a -> Int -> MVector s a -> ST s ()
+flushBuf !buf !off !mv = go 0
+  where
+    go !i
+      | i >= off = pure ()
+      | otherwise = do
+          x <- readSmallArray buf i
+          mPush mv x
+          go (i + 1)
+{-# INLINE flushBuf #-}
+
+pushTailElems :: SmallArray a -> Int -> MVector s a -> ST s ()
+pushTailElems !arr !len !mv = go 0
+  where
+    go !i
+      | i >= len  = pure ()
+      | otherwise = mPush mv (indexSmallArray arr i) >> go (i + 1)
+{-# INLINE pushTailElems #-}
+
+uninitElem :: a
+uninitElem = error "pvector: uninitialised element"
+{-# NOINLINE uninitElem #-}
 
 ------------------------------------------------------------------------
 -- Transient (mutable) operations
