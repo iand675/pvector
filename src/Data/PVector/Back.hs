@@ -767,10 +767,25 @@ update :: Int -> a -> Vector a -> Vector a
 update i x v
   | i < 0 || i >= vSize v = error "Data.PVector.Back.update: out of bounds"
   | i >= tailOff = v { vTail = cloneAndSet (vTail v) (i .&. bfMask) x }
-  | otherwise    = v { vRoot = updateNode (vShift v) i x (vRoot v) }
+  | otherwise    = v { vRoot = updateNodeST (vShift v) i x (vRoot v) }
   where
     !tailOff = tailOffset (vSize v)
 {-# INLINE update #-}
+
+-- Path-copy update: clones each node on the root-to-leaf path.
+-- Uses cloneAndSet32 which avoids sizeofSmallArray overhead.
+updateNodeST :: Int -> Int -> a -> Node a -> Node a
+updateNodeST !shift !i x = go shift
+  where
+    go !level (Internal arr) =
+      let !subIdx = indexAtLevel i level
+          !child  = indexSmallArray arr subIdx
+          !child' = go (level - bfBits) child
+      in Internal (cloneAndSet32 arr subIdx child')
+    go _ (Leaf arr) =
+      Leaf (cloneAndSet32 arr (i .&. bfMask) x)
+    go _ Empty = error "pvector: updateNodeST hit Empty"
+{-# INLINE updateNodeST #-}
 
 -- | Bulk update from a list of (index, value) pairs.
 -- Defined via the recycling framework: @xs // ps = new (updateNew (clone xs) ps)@.
@@ -2034,11 +2049,13 @@ updateNode = go
     go !level !i x (Internal arr) =
       let !subIdx = indexAtLevel i level
           !child  = indexSmallArray arr subIdx
-      in Internal (cloneAndSet arr subIdx (go (level - bfBits) i x child))
+      in Internal (cloneAndSet32 arr subIdx (go (level - bfBits) i x child))
     go _ !i x (Leaf arr) =
-      Leaf (cloneAndSet arr (i .&. bfMask) x)
+      Leaf (cloneAndSet32 arr (i .&. bfMask) x)
     go _ _ _ Empty = error "pvector: updateNode hit Empty"
 {-# INLINE updateNode #-}
+
+-- cloneAndSet32 is now in Internal.hs (Cmm primop)
 
 newPath :: Int -> Node a -> Node a
 newPath 0 node = node

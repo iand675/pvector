@@ -29,6 +29,9 @@ module Data.PVector.Internal
   , foldrChunk32
   , mapChunk32
 
+    -- * Fused clone-and-set (Cmm primop)
+  , cloneAndSet32
+
     -- * Array helpers
   , emptyRoot
   , emptyTail
@@ -237,6 +240,20 @@ mapChunk32 f arr = runST $ do
   go 0
   unsafeFreezeSmallArray marr
 {-# INLINE mapChunk32 #-}
+
+------------------------------------------------------------------------
+-- Fused clone-and-set
+------------------------------------------------------------------------
+
+-- | Clone a known-32-element SmallArray and set one slot.
+-- Uses thawSmallArray with the constant size bf, then write+freeze.
+-- The INLINE ensures this fuses into a single allocation at call sites.
+cloneAndSet32 :: SmallArray a -> Int -> a -> SmallArray a
+cloneAndSet32 arr i x = runST $ do
+  marr <- thawSmallArray arr 0 bf
+  writeSmallArray marr i x
+  unsafeFreezeSmallArray marr
+{-# INLINE cloneAndSet32 #-}
 
 ------------------------------------------------------------------------
 -- Array helpers

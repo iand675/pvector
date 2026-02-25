@@ -61,13 +61,23 @@ main = defaultMain
       ]
     | n <- sizes
     ]
-  , bgroup "update (single, middle)"
+  , bgroup "update (single, middle, nf)"
     [ env (setupAll n) $ \ ~(_xs, vec, pvec, sq) ->
       let !mid = n `div` 2 in
       bgroup (show n)
       [ bench "Vector" $ nf (\v -> v V.// [(mid, 0)]) vec
       , bench "PVector" $ nf (P.update mid 0) pvec
       , bench "Seq" $ nf (Seq.update mid 0) sq
+      ]
+    | n <- sizes
+    ]
+  , bgroup "update (single, middle, whnf)"
+    [ env (setupAll n) $ \ ~(_xs, vec, pvec, sq) ->
+      let !mid = n `div` 2 in
+      bgroup (show n)
+      [ bench "Vector" $ whnf (\v -> v V.// [(mid, 0)]) vec
+      , bench "PVector" $ whnf (P.update mid 0) pvec
+      , bench "Seq" $ whnf (Seq.update mid 0) sq
       ]
     | n <- sizes
     ]

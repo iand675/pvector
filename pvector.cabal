@@ -33,6 +33,7 @@ library
                      , deepseq >= 1.4
                      , primitive >= 0.7.3
   hs-source-dirs:      src
+  -- cmm-sources:         cbits/CloneAndSet.cmm
   default-language:    GHC2021
   ghc-options:         -O2
                        -Wall

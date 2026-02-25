@@ -1,0 +1,41 @@
+// pvector_cloneSmallArrayAndSet#
+//
+// Fused clone-and-set for SmallArray#.  Allocates a new SmallArray#,
+// copies all entries from the source, overwrites one slot with a new
+// value, and returns the result as a frozen (immutable) array — all
+// in a single heap check.
+//
+// Arguments:
+//   src   :: SmallArray# a    — source array
+//   idx   :: Int#             — index to overwrite
+//   val   :: a                — new value
+//
+// Returns:  SmallArray# a    — cloned array with slot `idx` set to `val`
+
+#include "Cmm.h"
+
+pvector_cloneSmallArrayAndSetzh(P_ src, W_ idx, P_ val)
+{
+    W_ ptrs, size_in_words, size_in_bytes;
+    P_ dst;
+
+    ptrs = StgSmallMutArrPtrs_ptrs(src);
+    size_in_words = ptrs + SIZEOF_StgSmallMutArrPtrs / SIZEOF_W;
+    size_in_bytes = WDS(size_in_words);
+
+    ALLOC_PRIM_P(size_in_bytes, pvector_cloneSmallArrayAndSetzh, val);
+
+    dst = Hp - size_in_bytes + WDS(1);
+    SET_HDR(dst, stg_SMALL_MUT_ARR_PTRS_FROZEN_CLEAN_info, CCCS);
+    StgSmallMutArrPtrs_ptrs(dst) = ptrs;
+
+    // Bulk copy all entries
+    prim %memcpy(dst + SIZEOF_StgSmallMutArrPtrs,
+                 src + SIZEOF_StgSmallMutArrPtrs,
+                 WDS(ptrs), SIZEOF_W);
+
+    // Overwrite the target slot
+    W_[dst + SIZEOF_StgSmallMutArrPtrs + WDS(idx)] = val;
+
+    return (dst);
+}
