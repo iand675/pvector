@@ -272,11 +272,10 @@ eqArrays a1 a2 !i !n
 
 eqNodes :: Eq a => Int -> Node a -> Node a -> Bool
 eqNodes _ Empty Empty = True
-eqNodes _ (Leaf a1) (Leaf a2) = eqArrays a1 a2 0 (sizeofSmallArray a1)
+eqNodes _ (Leaf a1) (Leaf a2) = eqArrays a1 a2 0 bf
 eqNodes shift (Internal a1) (Internal a2) = go 0
   where
-    !n = sizeofSmallArray a1
-    go i | i >= n = True
+    go i | i >= bf = True
          | otherwise = eqNodes (shift - bfBits) (indexSmallArray a1 i) (indexSmallArray a2 i)
                        && go (i + 1)
 eqNodes _ _ _ = False
@@ -303,11 +302,10 @@ cmpNodes :: Ord a => Int -> Node a -> Node a -> Ordering
 cmpNodes _ Empty Empty = EQ
 cmpNodes _ Empty _     = LT
 cmpNodes _ _     Empty = GT
-cmpNodes _ (Leaf a1) (Leaf a2) = cmpArrays a1 a2 0 (min (sizeofSmallArray a1) (sizeofSmallArray a2))
+cmpNodes _ (Leaf a1) (Leaf a2) = cmpArrays a1 a2 0 bf
 cmpNodes shift (Internal a1) (Internal a2) = go 0
   where
-    !n = min (sizeofSmallArray a1) (sizeofSmallArray a2)
-    go i | i >= n = EQ
+    go i | i >= bf = EQ
          | otherwise = case cmpNodes (shift - bfBits) (indexSmallArray a1 i) (indexSmallArray a2 i) of
               EQ -> go (i + 1)
               x  -> x
@@ -715,8 +713,8 @@ mapNode :: Int -> (a -> b) -> Node a -> Node b
 mapNode _ _ Empty = Empty
 mapNode _ f (Leaf arr) = Leaf (mapArray' f arr)
 mapNode shift f (Internal arr) = Internal $ runST $ do
-  let !n = sizeofSmallArray arr
-  marr <- newSmallArray n Empty
+  marr <- newSmallArray bf Empty
+  let !n = bf
   let go i
         | i >= n = pure ()
         | otherwise = do
@@ -834,9 +832,9 @@ filterDirect p v
 
 filterNode :: (a -> Bool) -> MVector s a -> Int -> Node a -> ST s ()
 filterNode _ _ _ Empty = pure ()
-filterNode p mv _ (Leaf arr) = filterChunk p mv arr 0 (sizeofSmallArray arr)
+filterNode p mv _ (Leaf arr) = filterChunk p mv arr 0 bf
 filterNode p mv level (Internal arr) = do
-  let !n = sizeofSmallArray arr
+  let !n = bf
       go i | i >= n = pure ()
            | otherwise = do
                filterNode p mv (level - bfBits) (indexSmallArray arr i)
@@ -947,14 +945,14 @@ foldlDirect = foldl'
 foldlWithChunks :: (b -> SmallArray a -> Int -> b) -> b -> Vector a -> b
 foldlWithChunks f z0 v
   | vSize v == 0 = z0
-  | otherwise    = f (goNode z0 (vShift v) (vRoot v)) (vTail v) (sizeofSmallArray (vTail v))
+  | otherwise    = f (goNode z0 (vShift v) (vRoot v)) (vTail v) tailSz
   where
+    !tailSz = sizeofSmallArray (vTail v)
     goNode !z !_ Empty = z
-    goNode !z !_ (Leaf arr) = f z arr (sizeofSmallArray arr)
+    goNode !z !_ (Leaf arr) = f z arr bf
     goNode !z !level (Internal arr) =
-      let !cn = sizeofSmallArray arr
-          goC !z' !i
-            | i >= cn   = z'
+      let goC !z' !i
+            | i >= bf   = z'
             | otherwise = goC (goNode z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
       in goC z 0
 
@@ -992,11 +990,10 @@ foldl1ViaNode f shift root tail_ =
       | i >= limit = z
       | otherwise  = goArr (f z (indexSmallArray arr i)) arr (i + 1) limit
     goNode !z !_ Empty = z
-    goNode !z !_ (Leaf arr) = goArr z arr 0 (sizeofSmallArray arr)
+    goNode !z !_ (Leaf arr) = goArr z arr 0 bf
     goNode !z !level (Internal arr) =
-      let !cn = sizeofSmallArray arr
-          goC !z' !i
-            | i >= cn   = z'
+      let goC !z' !i
+            | i >= bf   = z'
             | otherwise = goC (goNode z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
       in goC z 0
     goTail !z = goArr z tail_ 0 tailSz
@@ -1021,16 +1018,16 @@ foldrDirect = foldr
 foldrWithChunks :: (SmallArray a -> Int -> b -> b) -> Vector a -> b -> b
 foldrWithChunks f v z0
   | vSize v == 0 = z0
-  | otherwise    = goNode (vShift v) (vRoot v) (f (vTail v) (sizeofSmallArray (vTail v)) z0)
+  | otherwise    = goNode (vShift v) (vRoot v) (f (vTail v) tailSz z0)
   where
+    !tailSz = sizeofSmallArray (vTail v)
     goNode !_ Empty rest = rest
-    goNode !_ (Leaf arr) rest = f arr (sizeofSmallArray arr) rest
+    goNode !_ (Leaf arr) rest = f arr bf rest
     goNode !level (Internal arr) rest =
-      let !cn = sizeofSmallArray arr
-          goC !i !r
+      let goC !i !r
             | i < 0     = r
             | otherwise = goC (i - 1) (goNode (level - bfBits) (indexSmallArray arr i) r)
-      in goC (cn - 1) rest
+      in goC (bf - 1) rest
 
 -- | Right fold over SmallArray range [i, limit).
 foldrArr :: (a -> b -> b) -> SmallArray a -> Int -> Int -> b -> b
@@ -1073,11 +1070,10 @@ ifoldNode :: (b -> Int -> a -> b) -> b -> Int -> Int -> Node a -> (b, Int)
 ifoldNode f = go
   where
     go !z !off !_ Empty = (z, off)
-    go !z !off !_ (Leaf arr) = ifoldArr f z off arr 0 (sizeofSmallArray arr)
+    go !z !off !_ (Leaf arr) = ifoldArr f z off arr 0 bf
     go !z !off !level (Internal arr) =
-      let !n = sizeofSmallArray arr
-          goC !z' !off' !i
-            | i >= n = (z', off')
+      let goC !z' !off' !i
+            | i >= bf = (z', off')
             | otherwise =
                 let (!z'', !off'') = go z' off' (level - bfBits) (indexSmallArray arr i)
                 in goC z'' off'' (i + 1)
@@ -1382,11 +1378,10 @@ forI_ v f
 
 forNodeI_ :: (Int -> a -> ST s ()) -> Int -> Int -> Node a -> ST s Int
 forNodeI_ _ off _ Empty = pure off
-forNodeI_ f off _ (Leaf arr) = forArrI_ f off arr 0 (sizeofSmallArray arr)
+forNodeI_ f off _ (Leaf arr) = forArrI_ f off arr 0 bf
 forNodeI_ f off level (Internal arr) = do
-  let !n = sizeofSmallArray arr
-      go !o !i
-        | i >= n = pure o
+  let go !o !i
+        | i >= bf = pure o
         | otherwise = do
             o' <- forNodeI_ f o (level - bfBits) (indexSmallArray arr i)
             go o' (i + 1)
@@ -1410,11 +1405,10 @@ forEach_ v f
 
 forNode_ :: (a -> ST s ()) -> Int -> Node a -> ST s ()
 forNode_ _ _ Empty = pure ()
-forNode_ f _ (Leaf arr) = forArr_ f arr 0 (sizeofSmallArray arr)
+forNode_ f _ (Leaf arr) = forArr_ f arr 0 bf
 forNode_ f level (Internal arr) = do
-  let !n = sizeofSmallArray arr
-      go !i
-        | i >= n = pure ()
+  let go !i
+        | i >= bf = pure ()
         | otherwise = forNode_ f (level - bfBits) (indexSmallArray arr i) >> go (i + 1)
   go 0
 

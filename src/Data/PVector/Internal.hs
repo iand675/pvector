@@ -77,9 +77,8 @@ instance NFData a => NFData (Node a) where
   rnf (Leaf arr) = rnfArray arr
   rnf (Internal arr) = go 0
     where
-      !n = sizeofSmallArray arr
       go i
-        | i >= n    = ()
+        | i >= bf   = ()
         | otherwise = rnf (indexSmallArray arr i) `seq` go (i + 1)
 
 ------------------------------------------------------------------------
@@ -119,10 +118,9 @@ editableInternal
   -> m (SmallMutableArray (PrimState m) (MNode (PrimState m) a))
 editableInternal (MInternal arr) = pure arr
 editableInternal (Frozen (Internal arr)) = do
-  let !n = sizeofSmallArray arr
-  marr <- newSmallArray n (Frozen Empty)
+  marr <- newSmallArray bf (Frozen Empty)
   let go i
-        | i >= n    = pure ()
+        | i >= bf   = pure ()
         | otherwise = do
             writeSmallArray marr i (Frozen (indexSmallArray arr i))
             go (i + 1)
@@ -150,18 +148,15 @@ editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 mMapNodeInPlace :: PrimMonad m => (a -> a) -> Int -> MNode (PrimState m) a -> m (MNode (PrimState m) a)
 mMapNodeInPlace _ _ n@(Frozen Empty) = pure n
 mMapNodeInPlace f _ (MLeaf arr) = do
-  n <- getSizeofSmallMutableArray arr
-  mapMutableArr f arr 0 n
+  mapMutableArr f arr 0 bf
   pure (MLeaf arr)
 mMapNodeInPlace f _ (Frozen (Leaf arr)) = do
-  let !n = sizeofSmallArray arr
-  marr <- thawSmallArray arr 0 n
-  mapMutableArr f marr 0 n
+  marr <- thawSmallArray arr 0 bf
+  mapMutableArr f marr 0 bf
   pure (MLeaf marr)
 mMapNodeInPlace f shift (MInternal arr) = do
-  n <- getSizeofSmallMutableArray arr
   let go i
-        | i >= n    = pure ()
+        | i >= bf   = pure ()
         | otherwise = do
             child <- readSmallArray arr i
             child' <- mMapNodeInPlace f (shift - bfBits) child
@@ -170,10 +165,9 @@ mMapNodeInPlace f shift (MInternal arr) = do
   go 0
   pure (MInternal arr)
 mMapNodeInPlace f shift (Frozen (Internal arr)) = do
-  let !n = sizeofSmallArray arr
-  marr <- newSmallArray n (Frozen Empty)
+  marr <- newSmallArray bf (Frozen Empty)
   let go i
-        | i >= n    = pure ()
+        | i >= bf   = pure ()
         | otherwise = do
             child' <- mMapNodeInPlace f (shift - bfBits) (Frozen (indexSmallArray arr i))
             writeSmallArray marr i child'
