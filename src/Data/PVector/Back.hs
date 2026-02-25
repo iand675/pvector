@@ -1813,8 +1813,297 @@ append :: Vector a -> Vector a -> Vector a
 append v1 v2
   | null v1   = v2
   | null v2   = v1
-  | otherwise = create $ \mv -> appendChunked mv v1 v2
+  | sizeofSmallArray (vTail v1) == bf = appendAligned v1 v2
+  | otherwise = appendGraft v1 v2
 {-# INLINE append #-}
+
+-- | Append when v1's tail is exactly bf elements (aligned boundary).
+-- Flushes v1's tail into its tree, then grafts v2's tree as a sibling.
+appendAligned :: Vector a -> Vector a -> Vector a
+appendAligned v1 v2 =
+  let !n = vSize v1 + vSize v2
+      !(s1, r1) = flushTailPure (vSize v1) (vShift v1) (vRoot v1) (vTail v1)
+  in case vRoot v2 of
+    Empty -> Vector n s1 r1 (vTail v2)
+    _     -> let !(rs, rr) = graftRight s1 r1 (vShift v2) (vRoot v2)
+             in Vector n rs rr (vTail v2)
+
+-- | Flush a full tail into the tree (pure, persistent path).
+flushTailPure :: Int -> Int -> Node a -> SmallArray a -> (Int, Node a)
+flushTailPure n shift root tailArr
+  | willOverflow =
+      let !arr = runST $ do
+            a <- newSmallArray bf Empty
+            writeSmallArray a 0 root
+            writeSmallArray a 1 (newPath shift (Leaf tailArr))
+            unsafeFreezeSmallArray a
+      in (shift + bfBits, Internal arr)
+  | otherwise =
+      (shift, pushTail n shift root tailArr)
+  where !willOverflow = unsafeShiftR n bfBits > unsafeShiftL 1 shift
+
+-- | Graft rightTree as the next subtree after leftTree.
+-- If shifts match, creates a new root one level up.
+-- If leftTree is deeper, inserts rightTree into leftTree's first available slot.
+graftRight :: Int -> Node a -> Int -> Node a -> (Int, Node a)
+graftRight s1 r1 s2 r2
+  | s1 == s2 =
+      (s1 + bfBits, Internal $ runST $ do
+        a <- newSmallArray bf Empty
+        writeSmallArray a 0 r1
+        writeSmallArray a 1 r2
+        unsafeFreezeSmallArray a)
+  | s1 > s2 =
+      case r1 of
+        Internal arr ->
+          let !slot = firstEmptySlot arr 0
+          in if slot < bf
+             then let !lifted = liftToShift (s1 - bfBits) s2 r2
+                  in (s1, Internal (cloneAndSet arr slot lifted))
+             else (s1 + bfBits, Internal $ runST $ do
+                     a <- newSmallArray bf Empty
+                     writeSmallArray a 0 r1
+                     writeSmallArray a 1 (liftToShift s1 s2 r2)
+                     unsafeFreezeSmallArray a)
+        _ -> (s1 + bfBits, Internal $ runST $ do
+                a <- newSmallArray bf Empty
+                writeSmallArray a 0 r1
+                writeSmallArray a 1 (liftToShift s1 s2 r2)
+                unsafeFreezeSmallArray a)
+  | otherwise =
+      graftRight s2 (liftToShift s2 s1 r1) s2 r2
+
+-- | Wrap a node in newPath calls to raise it to a target shift level.
+liftToShift :: Int -> Int -> Node a -> Node a
+liftToShift targetShift currentShift node
+  | currentShift >= targetShift = node
+  | otherwise = liftToShift targetShift (currentShift + bfBits) $
+      Internal $ runST $ do
+        a <- newSmallArray bf Empty
+        writeSmallArray a 0 node
+        unsafeFreezeSmallArray a
+
+-- | Find the first Empty slot in an Internal node's children.
+firstEmptySlot :: SmallArray (Node a) -> Int -> Int
+firstEmptySlot arr !i
+  | i >= bf = bf
+  | otherwise = case indexSmallArray arr i of
+      Empty -> i
+      _     -> firstEmptySlot arr (i + 1)
+
+-- | Append with misaligned boundary: graft v1's root directly into the
+-- result tree, create a merged leaf at the boundary, and rechunk the
+-- remaining v2 elements into a second subtree. No mPush/mPushChunk overhead.
+appendGraft :: Vector a -> Vector a -> Vector a
+appendGraft v1 v2
+  | vSize v2 + sizeofSmallArray (vTail v1) <= bf =
+      -- v1's tail + all of v2 fit in a single tail (no new tree leaf needed)
+      let !n = vSize v1 + vSize v2
+          !k1 = sizeofSmallArray (vTail v1)
+          !newTail = runST $ do
+            marr <- newSmallArray n' uninitElem
+            copySmallArray marr 0 (vTail v1) 0 k1
+            copyFromVectorPure marr k1 (vSize v2) v2 0
+            unsafeFreezeSmallArray marr
+          !n' = k1 + vSize v2
+      in Vector n (vShift v1) (vRoot v1) newTail
+  | otherwise = appendGraftFull v1 v2
+  where
+    copyFromVectorPure !dst !dstOff !count !v !vOff = do
+      let !toff = tailOffset (vSize v)
+          go !d !src !remaining
+            | remaining <= 0 = pure ()
+            | src >= toff = do
+                let !tailOff = src - toff
+                    !avail = sizeofSmallArray (vTail v) - tailOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d (vTail v) tailOff toCopy
+            | otherwise = do
+                let !arr = leafFor (vShift v) src (vRoot v)
+                    !leafOff = src .&. bfMask
+                    !avail = bf - leafOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d arr leafOff toCopy
+                go (d + toCopy) (src + toCopy) (remaining - toCopy)
+      go dstOff vOff count
+
+appendGraftFull :: Vector a -> Vector a -> Vector a
+appendGraftFull v1 v2 = runST $ do
+  let !n = vSize v1 + vSize v2
+      !k1 = sizeofSmallArray (vTail v1)
+      !need = bf - k1
+
+  -- Build merged leaf: v1's tail + first `need` elements from v2
+  mergedLeaf <- do
+    marr <- newSmallArray bf uninitElem
+    copySmallArray marr 0 (vTail v1) 0 k1
+    let !toff2 = tailOffset (vSize v2)
+    if toff2 > 0
+      then do
+        let !arr = leafFor (vShift v2) 0 (vRoot v2)
+        copySmallArray marr k1 arr 0 need
+      else
+        copySmallArray marr k1 (vTail v2) 0 need
+    Leaf <$> unsafeFreezeSmallArray marr
+
+  -- Build child0: v1's root with merged leaf in the next available slot
+  let !child0 = case vRoot v1 of
+        Empty -> Internal $ runST $ do
+          a <- newSmallArray bf Empty
+          writeSmallArray a 0 mergedLeaf
+          unsafeFreezeSmallArray a
+        Internal arr ->
+          let !slot = firstEmptySlot arr 0
+          in Internal (cloneAndSet arr slot mergedLeaf)
+        _ -> error "pvector: appendGraft invariant"
+
+  -- Rechunk remaining v2 elements (starting at offset `need` into v2)
+  -- into a second subtree + result tail.
+  -- Remaining = n2 - need elements from v2.
+  let !remaining = vSize v2 - need
+  if remaining <= 0
+    then
+      -- All of v2 fit in the merged leaf. Result tail is empty-ish.
+      pure (Vector n (vShift v1) child0 emptyTail)
+    else do
+      -- Collect rechunked leaves from v2 (starting at offset `need`)
+      -- and build child1 + result tail.
+      buf <- newSmallArray bf uninitElem
+      -- leafBuf collects full rechunked leaves
+      leafBuf <- newSmallArray bf (undefined :: SmallArray a)
+      let !v2s = vShift v2
+          !v2r = vRoot v2
+          !v2t = vTail v2
+          !v2ts = sizeofSmallArray v2t
+
+      (!nRechunked, !buf', !bufOff') <- rechunkFrom buf 0 leafBuf 0 need v2s v2r v2t v2ts
+
+      -- Build result tail from remaining buffer
+      frozenTail <- if bufOff' > 0
+        then do
+          rt <- newSmallArray bufOff' uninitElem
+          copySmallMutableArray rt 0 buf' 0 bufOff'
+          unsafeFreezeSmallArray rt
+        else pure emptyTail
+
+      -- Build child1 from rechunked leaves
+      child1 <- if nRechunked > 0
+        then do
+          c1arr <- newSmallArray bf Empty
+          let go !i
+                | i >= nRechunked = pure ()
+                | otherwise = do
+                    la <- readSmallArray leafBuf i
+                    writeSmallArray c1arr i (Leaf la)
+                    go (i + 1)
+          go 0
+          Internal <$> unsafeFreezeSmallArray c1arr
+        else pure Empty
+
+      -- Compute result shift and root
+      let !s1 = vShift v1
+          !(rs, rr) = case child1 of
+            Empty -> (s1, child0)
+            _     -> graftRight s1 child0 s1 child1
+
+      pure (Vector n rs rr frozenTail)
+  where
+    -- Copy `count` elements from a vector starting at element offset `vOff`
+    -- into a mutable array at `dstOff`.
+    copyFromVector :: SmallMutableArray s a -> Int -> Int -> Vector a -> Int -> ST s ()
+    copyFromVector !dst !dstOff !count !v !vOff = do
+      let !toff = tailOffset (vSize v)
+          !shift = vShift v
+          !root = vRoot v
+          !tail_ = vTail v
+          go !d !src !remaining
+            | remaining <= 0 = pure ()
+            | src >= toff = do
+                let !tailOff = src - toff
+                    !avail = sizeofSmallArray tail_ - tailOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d tail_ tailOff toCopy
+            | otherwise = do
+                let !arr = leafFor shift src root
+                    !leafOff = src .&. bfMask
+                    !avail = bf - leafOff
+                    !toCopy = min remaining avail
+                copySmallArray dst d arr leafOff toCopy
+                go (d + toCopy) (src + toCopy) (remaining - toCopy)
+      go dstOff vOff count
+
+    -- Rechunk v2 elements starting at offset `skip` into full 32-element chunks.
+    -- Walks v2's tree leaves and tail, shifting by `skip`.
+    rechunkFrom :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> Int -> Int -> Node a -> SmallArray a -> Int
+                -> ST s (Int, SmallMutableArray s a, Int)
+    rechunkFrom !buf !bufOff !leafBuf !leafIdx !skip !v2Shift !v2Root !v2Tail !v2TailSz = do
+      (buf1, bo1, li1) <- rechunkNode buf bufOff leafBuf leafIdx skip v2Shift v2Root
+      let !treeElems = treeSize v2Shift v2Root
+          !tailSkip = max 0 (skip - treeElems)
+          !tailOff = tailSkip
+          !tailLen = v2TailSz - tailOff
+      if tailLen > 0
+        then do
+          (b, o, l) <- rechunkCopy buf1 bo1 leafBuf li1 v2Tail tailOff tailLen
+          pure (l, b, o)
+        else pure (li1, buf1, bo1)
+
+    treeSize :: Int -> Node a -> Int
+    treeSize _ Empty = 0
+    treeSize _ (Leaf _) = bf
+    treeSize shift (Internal arr) =
+      let !n = countNonEmpty arr
+      in n * (unsafeShiftL 1 shift)
+
+    countNonEmpty :: SmallArray (Node a) -> Int
+    countNonEmpty arr = go 0 0
+      where go !i !c
+              | i >= sizeofSmallArray arr = c
+              | otherwise = case indexSmallArray arr i of
+                  Empty -> go (i + 1) c
+                  _     -> go (i + 1) (c + 1)
+
+    rechunkNode :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> Int -> Int -> Node a
+                -> ST s (SmallMutableArray s a, Int, Int)
+    rechunkNode !buf !bo !lb !li !skip !_ Empty = pure (buf, bo, li)
+    rechunkNode !buf !bo !lb !li !skip !_ (Leaf arr)
+      | skip >= bf = pure (buf, bo, li)
+      | otherwise = rechunkCopy buf bo lb li arr skip (bf - skip)
+    rechunkNode !buf !bo !lb !li !skip !level (Internal arr) = do
+      let !childSize = unsafeShiftL 1 level
+          go !b !o !l !sk !i
+            | i >= bf = pure (b, o, l)
+            | sk >= childSize = go b o l (sk - childSize) (i + 1)
+            | otherwise = do
+                (b', o', l') <- rechunkNode b o lb l sk (level - bfBits) (indexSmallArray arr i)
+                go b' o' l' 0 (i + 1)
+      go buf bo li skip 0
+
+    rechunkCopy :: SmallMutableArray s a -> Int
+                -> SmallMutableArray s (SmallArray a) -> Int
+                -> SmallArray a -> Int -> Int
+                -> ST s (SmallMutableArray s a, Int, Int)
+    rechunkCopy !buf !bo !lb !li !src !srcOff !srcLen = go buf bo li srcOff srcLen
+      where
+        go !b !o !l !so !sl
+          | sl <= 0 = pure (b, o, l)
+          | otherwise = do
+              let !avail = bf - o
+                  !toCopy = min sl avail
+              copySmallArray b o src so toCopy
+              let !newO = o + toCopy
+              if newO >= bf
+                then do
+                  frozen <- unsafeFreezeSmallArray b
+                  writeSmallArray lb l frozen
+                  newBuf <- newSmallArray bf uninitElem
+                  go newBuf 0 (l + 1) (so + toCopy) (sl - toCopy)
+                else
+                  pure (b, newO, l)
 
 appendChunked :: MVector s a -> Vector a -> Vector a -> ST s ()
 appendChunked mv v1 v2 = do
