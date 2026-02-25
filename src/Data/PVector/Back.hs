@@ -666,17 +666,17 @@ index v i
   | i < 0 || i >= vSize v = error $ "Data.PVector.Back.index: " Prelude.++ show i
                                   Prelude.++ " out of bounds [0," Prelude.++ show (vSize v) Prelude.++ ")"
   | otherwise = unsafeIndex v i
-{-# INLINE index #-}
+{-# INLINE [1] index #-}
 
 (!) :: Vector a -> Int -> a
 (!) = index
-{-# INLINE (!) #-}
+{-# INLINE [1] (!) #-}
 
 (!?) :: Vector a -> Int -> Maybe a
 (!?) v i
   | i < 0 || i >= vSize v = Nothing
   | otherwise = Just $! unsafeIndex v i
-{-# INLINE (!?) #-}
+{-# INLINE [1] (!?) #-}
 
 unsafeIndex :: Vector a -> Int -> a
 unsafeIndex v i
@@ -684,19 +684,19 @@ unsafeIndex v i
   | otherwise    = indexSmallArray (leafFor (vShift v) i (vRoot v)) (i .&. bfMask)
   where
     !tailOff = tailOffset (vSize v)
-{-# INLINE unsafeIndex #-}
+{-# INLINE [1] unsafeIndex #-}
 
 head :: Vector a -> a
 head v
   | vSize v == 0 = error "Data.PVector.Back.head: empty"
   | otherwise     = unsafeIndex v 0
-{-# INLINE head #-}
+{-# INLINE [1] head #-}
 
 last :: Vector a -> a
 last v
   | vSize v == 0 = error "Data.PVector.Back.last: empty"
   | otherwise     = indexSmallArray (vTail v) (sizeofSmallArray (vTail v) - 1)
-{-# INLINE last #-}
+{-# INLINE [1] last #-}
 
 indexM :: Monad m => Vector a -> Int -> m a
 indexM v i = index v i `seq` pure (index v i)
@@ -2703,6 +2703,24 @@ liftSmap f (MStream step s0) = MStream step' s0
   foldlDirect f z (unstream s) = S.sfoldl' f z s
 "pvector/foldrDirect/unstream" forall f z s.
   foldrDirect f z (unstream s) = S.sfoldr f z s
+
+-- === Consumer forwarding: index/head/last directly from a stream ===
+-- Avoids materialising an entire vector just to read one element.
+-- E.g. head (map f v) becomes shead (smap f (stream v)) — O(1) work.
+"pvector/index/unstream" forall s i.
+  index (unstream s) i = S.sindex s i
+"pvector/(!?)/unstream" forall s i.
+  (unstream s) !? i = S.sindexM s i
+"pvector/head/unstream" forall s.
+  head (unstream s) = S.shead s
+"pvector/last/unstream" forall s.
+  last (unstream s) = S.slast s
+"pvector/unsafeIndex/unstream" forall s i.
+  unsafeIndex (unstream s) i = S.sindex s i
+
+-- === General uninplace: expose inplace form for further fusion ===
+"pvector/uninplace" forall (f :: forall m. Monad m => S.MStream m a -> S.MStream m a) g p.
+  stream (new (transform f g p)) = S.inplace f g (stream (new p))
 
 -- === Fallback rules: revert to direct implementations when not fused ===
 -- Phase [1] fires late so only standalone (unfused) operations match.

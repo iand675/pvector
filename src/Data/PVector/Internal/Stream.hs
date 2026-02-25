@@ -72,6 +72,10 @@ module Data.PVector.Internal.Stream
   , slength
   , snull
   , stoList
+  , shead
+  , slast
+  , sindex
+  , sindexM
 
     -- * Monadic stream combinators (for inplace)
   , smapM
@@ -455,6 +459,48 @@ snull (Bundle (MStream step s0) _) = go s0
 stoList :: Bundle a -> [a]
 stoList = sfoldr (:) []
 {-# INLINE stoList #-}
+
+shead :: Bundle a -> a
+shead (Bundle (MStream step s0) _) = go s0
+  where
+    go s = case unId (step s) of
+      Yield a _ -> a
+      Skip   s' -> go s'
+      Done      -> error "pvector: shead of empty stream"
+{-# INLINE [1] shead #-}
+
+slast :: Bundle a -> a
+slast (Bundle (MStream step s0) _) = start s0
+  where
+    start s = case unId (step s) of
+      Yield a s' -> go a s'
+      Skip    s' -> start s'
+      Done       -> error "pvector: slast of empty stream"
+    go !prev s = case unId (step s) of
+      Yield a s' -> go a s'
+      Skip    s' -> go prev s'
+      Done       -> prev
+{-# INLINE [1] slast #-}
+
+sindex :: Bundle a -> Int -> a
+sindex (Bundle (MStream step s0) _) i = go i s0
+  where
+    go !j s = case unId (step s) of
+      Yield a s' | j == 0    -> a
+                 | otherwise -> go (j - 1) s'
+      Skip    s'             -> go j s'
+      Done                   -> error "pvector: sindex out of bounds"
+{-# INLINE [1] sindex #-}
+
+sindexM :: Bundle a -> Int -> Maybe a
+sindexM (Bundle (MStream step s0) _) i = go i s0
+  where
+    go !j s = case unId (step s) of
+      Yield a s' | j == 0    -> Just a
+                 | otherwise -> go (j - 1) s'
+      Skip    s'             -> go j s'
+      Done                   -> Nothing
+{-# INLINE [1] sindexM #-}
 
 ------------------------------------------------------------------------
 -- Monadic stream combinators (polymorphic in m, needed for inplace)
