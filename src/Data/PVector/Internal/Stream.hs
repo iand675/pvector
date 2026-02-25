@@ -2,11 +2,46 @@
 {-# LANGUAGE ExistentialQuantification #-}
 {-# LANGUAGE RankNTypes #-}
 
+-- | Stream fusion framework for pvector.
+--
+-- Based on the approach from the @vector@ package:
+--
+--   * Pure 'Stream' for element-level stepping
+--   * 'MStream' for monadic stepping (needed for in-place transforms)
+--   * 'Bundle' carrying a stream + size hint
+--   * 'Id' identity monad for pure instantiation
+--
+-- The 'Bundle' is what operations produce/consume. Stream-level rules
+-- compose transformers; bundle-level @inplace@ marks candidates for
+-- in-place execution via the recycling framework.
 module Data.PVector.Internal.Stream
-  ( Step(..)
-  , Stream(..)
+  ( -- * Step
+    Step(..)
+
+    -- * Identity monad
+  , Id(..)
+
+    -- * Monadic stream
+  , MStream(..)
+
+    -- * Pure stream (Id-instantiated)
+  , Stream
+
+    -- * Size hints
   , Size(..)
-    -- * Stream producers
+  , smaller
+  , toMax
+  , upperBound
+
+    -- * Bundle (stream + size)
+  , Bundle(..)
+  , inplace
+  , size
+  , sized
+  , elements
+  , fromStream
+
+    -- * Bundle producers
   , empty
   , singleton
   , replicate
@@ -15,7 +50,8 @@ module Data.PVector.Internal.Stream
   , enumFromStepN
   , fromList
   , fromListN
-    -- * Stream transformers
+
+    -- * Bundle transformers
   , smap
   , simap
   , sfilter
@@ -23,7 +59,8 @@ module Data.PVector.Internal.Stream
   , stake
   , sdrop
   , sconcat
-    -- * Stream consumers
+
+    -- * Bundle consumers
   , sfoldl'
   , sifoldl'
   , sfoldr
@@ -35,21 +72,57 @@ module Data.PVector.Internal.Stream
 
 import Prelude hiding (replicate)
 
+------------------------------------------------------------------------
+-- Step
+------------------------------------------------------------------------
+
 data Step s a
   = Yield a s
   | Skip  s
   | Done
 
+------------------------------------------------------------------------
+-- Identity monad
+------------------------------------------------------------------------
+
+newtype Id a = Id { unId :: a }
+
+instance Functor Id where
+  fmap f (Id x) = Id (f x)
+  {-# INLINE fmap #-}
+
+instance Applicative Id where
+  pure = Id
+  Id f <*> Id x = Id (f x)
+  {-# INLINE pure #-}
+  {-# INLINE (<*>) #-}
+
+instance Monad Id where
+  return = pure
+  Id x >>= f = f x
+  {-# INLINE return #-}
+  {-# INLINE (>>=) #-}
+
+------------------------------------------------------------------------
+-- Monadic stream
+------------------------------------------------------------------------
+
+data MStream m a = forall s. MStream (s -> m (Step s a)) s
+
+------------------------------------------------------------------------
+-- Pure stream (specialised to Id)
+------------------------------------------------------------------------
+
+type Stream = MStream Id
+
+------------------------------------------------------------------------
+-- Size hints
+------------------------------------------------------------------------
+
 data Size
   = Exact {-# UNPACK #-} !Int
   | Max   {-# UNPACK #-} !Int
   | Unknown
-
-data Stream a = forall s. Stream (s -> Step s a) s !Size
-
-------------------------------------------------------------------------
--- Size combinators
-------------------------------------------------------------------------
 
 smaller :: Size -> Size -> Size
 smaller (Exact a) (Exact b) = Exact (min a b)
@@ -68,141 +141,183 @@ toMax (Exact n) = Max n
 toMax s         = s
 {-# INLINE toMax #-}
 
+upperBound :: Size -> Maybe Int
+upperBound (Exact n) = Just n
+upperBound (Max   n) = Just n
+upperBound Unknown   = Nothing
+
+------------------------------------------------------------------------
+-- Bundle = stream + size
+------------------------------------------------------------------------
+
+data Bundle a = Bundle
+  { sElems :: Stream a
+  , sSize  :: !Size
+  }
+
+-- | Mark a bundle for in-place execution.  The monadic stream
+-- transformer @f@ will be applied to the elements; @g@ adjusts the
+-- size.  Semantically, @inplace f g b = fromStream (f (sElems b)) (g (sSize b))@.
+inplace :: (forall m. Monad m => MStream m a -> MStream m b)
+        -> (Size -> Size) -> Bundle a -> Bundle b
+{-# INLINE [1] inplace #-}
+inplace f g (Bundle s sz) = Bundle (f s) (g sz)
+
+-- | Extract the size.
+size :: Bundle a -> Size
+size = sSize
+{-# INLINE size #-}
+
+-- | Attach a new size hint.
+sized :: Bundle a -> Size -> Bundle a
+sized b sz = b { sSize = sz }
+{-# INLINE sized #-}
+
+-- | Extract the element stream.
+elements :: Bundle a -> Stream a
+elements = sElems
+{-# INLINE elements #-}
+
+-- | Wrap a stream and size into a bundle.
+fromStream :: Stream a -> Size -> Bundle a
+fromStream s sz = Bundle s sz
+{-# INLINE fromStream #-}
+
 ------------------------------------------------------------------------
 -- Producers
 ------------------------------------------------------------------------
 
-empty :: Stream a
-empty = Stream (const Done) () (Exact 0)
+empty :: Bundle a
+empty = Bundle (MStream (\() -> Id Done) ()) (Exact 0)
 {-# INLINE [1] empty #-}
 
-singleton :: a -> Stream a
-singleton x = Stream step True (Exact 1)
+singleton :: a -> Bundle a
+singleton x = Bundle (MStream step True) (Exact 1)
   where
-    step True  = Yield x False
-    step False = Done
+    step True  = Id (Yield x False)
+    step False = Id Done
 {-# INLINE [1] singleton #-}
 
-replicate :: Int -> a -> Stream a
-replicate n x = Stream step 0 (Exact (max 0 n))
+replicate :: Int -> a -> Bundle a
+replicate n x = Bundle (MStream step 0) (Exact (max 0 n))
   where
-    step i | i >= n    = Done
-           | otherwise = Yield x (i + 1)
+    step i | i >= n    = Id Done
+           | otherwise = Id (Yield x (i + 1))
 {-# INLINE [1] replicate #-}
 
-generate :: Int -> (Int -> a) -> Stream a
-generate n f = Stream step 0 (Exact (max 0 n))
+generate :: Int -> (Int -> a) -> Bundle a
+generate n f = Bundle (MStream step 0) (Exact (max 0 n))
   where
-    step i | i >= n    = Done
-           | otherwise = Yield (f i) (i + 1)
+    step i | i >= n    = Id Done
+           | otherwise = Id (Yield (f i) (i + 1))
 {-# INLINE [1] generate #-}
 
-unfoldr :: (b -> Maybe (a, b)) -> b -> Stream a
-unfoldr f s0 = Stream step (Just s0) Unknown
+unfoldr :: (b -> Maybe (a, b)) -> b -> Bundle a
+unfoldr f s0 = Bundle (MStream step (Just s0)) Unknown
   where
-    step Nothing  = Done
+    step Nothing  = Id Done
     step (Just s) = case f s of
-      Nothing      -> Done
-      Just (a, s') -> Yield a (Just s')
+      Nothing      -> Id Done
+      Just (a, s') -> Id (Yield a (Just s'))
 {-# INLINE [1] unfoldr #-}
 
-enumFromStepN :: Num a => a -> a -> Int -> Stream a
-enumFromStepN x0 dx n = Stream step (x0, 0) (Exact (max 0 n))
+enumFromStepN :: Num a => a -> a -> Int -> Bundle a
+enumFromStepN x0 dx n = Bundle (MStream step (x0, 0)) (Exact (max 0 n))
   where
     step (x, i)
-      | i >= n    = Done
-      | otherwise = Yield x (x + dx, i + 1)
+      | i >= n    = Id Done
+      | otherwise = Id (Yield x (x + dx, i + 1))
 {-# INLINE [1] enumFromStepN #-}
 
-fromList :: [a] -> Stream a
-fromList xs = Stream step xs Unknown
+fromList :: [a] -> Bundle a
+fromList xs = Bundle (MStream step xs) Unknown
   where
-    step []     = Done
-    step (a:as) = Yield a as
+    step []     = Id Done
+    step (a:as) = Id (Yield a as)
 {-# INLINE [1] fromList #-}
 
-fromListN :: Int -> [a] -> Stream a
-fromListN n xs = Stream step (xs, 0) (Exact (max 0 n))
+fromListN :: Int -> [a] -> Bundle a
+fromListN n xs = Bundle (MStream step (xs, 0)) (Exact (max 0 n))
   where
-    step (_, i)  | i >= n = Done
-    step ([], _)          = Done
-    step (a:as, i)        = Yield a (as, i + 1)
+    step (_, i)  | i >= n = Id Done
+    step ([], _)          = Id Done
+    step (a:as, i)        = Id (Yield a (as, i + 1))
 {-# INLINE [1] fromListN #-}
 
 ------------------------------------------------------------------------
 -- Transformers
 ------------------------------------------------------------------------
 
-smap :: (a -> b) -> Stream a -> Stream b
-smap f (Stream step s0 sz) = Stream step' s0 sz
+smap :: (a -> b) -> Bundle a -> Bundle b
+smap f (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) sz
   where
-    step' s = case step s of
-      Yield a s' -> Yield (f a) s'
-      Skip    s' -> Skip s'
-      Done       -> Done
+    step' s = case unId (step s) of
+      Yield a s' -> Id (Yield (f a) s')
+      Skip    s' -> Id (Skip s')
+      Done       -> Id Done
 {-# INLINE [1] smap #-}
 
-simap :: (Int -> a -> b) -> Stream a -> Stream b
-simap f (Stream step s0 sz) = Stream step' (s0, 0) sz
+simap :: (Int -> a -> b) -> Bundle a -> Bundle b
+simap f (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) sz
   where
-    step' (s, !i) = case step s of
-      Yield a s' -> Yield (f i a) (s', i + 1)
-      Skip    s' -> Skip (s', i)
-      Done       -> Done
+    step' (s, !i) = case unId (step s) of
+      Yield a s' -> Id (Yield (f i a) (s', i + 1))
+      Skip    s' -> Id (Skip (s', i))
+      Done       -> Id Done
 {-# INLINE [1] simap #-}
 
-sfilter :: (a -> Bool) -> Stream a -> Stream a
-sfilter p (Stream step s0 sz) = Stream step' s0 (toMax sz)
+sfilter :: (a -> Bool) -> Bundle a -> Bundle a
+sfilter p (Bundle (MStream step s0) sz) = Bundle (MStream step' s0) (toMax sz)
   where
-    step' s = case step s of
-      Yield a s' | p a       -> Yield a s'
-                 | otherwise -> Skip s'
-      Skip    s'             -> Skip s'
-      Done                   -> Done
+    step' s = case unId (step s) of
+      Yield a s' | p a       -> Id (Yield a s')
+                 | otherwise -> Id (Skip s')
+      Skip    s'             -> Id (Skip s')
+      Done                   -> Id Done
 {-# INLINE [1] sfilter #-}
 
-sifilter :: (Int -> a -> Bool) -> Stream a -> Stream a
-sifilter p (Stream step s0 sz) = Stream step' (s0, 0) (toMax sz)
+sifilter :: (Int -> a -> Bool) -> Bundle a -> Bundle a
+sifilter p (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) (toMax sz)
   where
-    step' (s, !i) = case step s of
-      Yield a s' | p i a     -> Yield a (s', i + 1)
-                 | otherwise -> Skip (s', i + 1)
-      Skip    s'             -> Skip (s', i)
-      Done                   -> Done
+    step' (s, !i) = case unId (step s) of
+      Yield a s' | p i a     -> Id (Yield a (s', i + 1))
+                 | otherwise -> Id (Skip (s', i + 1))
+      Skip    s'             -> Id (Skip (s', i))
+      Done                   -> Id Done
 {-# INLINE [1] sifilter #-}
 
-stake :: Int -> Stream a -> Stream a
-stake n (Stream step s0 sz) = Stream step' (s0, 0) (sz `smaller` Exact n)
+stake :: Int -> Bundle a -> Bundle a
+stake n (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) (sz `smaller` Exact n)
   where
     step' (s, i)
-      | i >= n    = Done
-      | otherwise = case step s of
-          Yield a s' -> Yield a (s', i + 1)
-          Skip    s' -> Skip (s', i)
-          Done       -> Done
+      | i >= n    = Id Done
+      | otherwise = case unId (step s) of
+          Yield a s' -> Id (Yield a (s', i + 1))
+          Skip    s' -> Id (Skip (s', i))
+          Done       -> Id Done
 {-# INLINE [1] stake #-}
 
-sdrop :: Int -> Stream a -> Stream a
-sdrop n (Stream step s0 sz) = Stream step' (s0, 0) sz'
+sdrop :: Int -> Bundle a -> Bundle a
+sdrop n (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) sz'
   where
     sz' = case sz of
       Exact m -> Exact (max 0 (m - n))
       Max   m -> Max   (max 0 (m - n))
       Unknown -> Unknown
     step' (s, i)
-      | i < n     = case step s of
-          Yield _ s' -> Skip (s', i + 1)
-          Skip    s' -> Skip (s', i)
-          Done       -> Done
-      | otherwise = case step s of
-          Yield a s' -> Yield a (s', i + 1)
-          Skip    s' -> Skip (s', i)
-          Done       -> Done
+      | i < n     = case unId (step s) of
+          Yield _ s' -> Id (Skip (s', i + 1))
+          Skip    s' -> Id (Skip (s', i))
+          Done       -> Id Done
+      | otherwise = case unId (step s) of
+          Yield a s' -> Id (Yield a (s', i + 1))
+          Skip    s' -> Id (Skip (s', i))
+          Done       -> Id Done
 {-# INLINE [1] sdrop #-}
 
-sconcat :: Stream a -> Stream a -> Stream a
-sconcat (Stream stepL sL0 szL) (Stream stepR sR0 szR) =
-  Stream step (Left sL0) sz
+sconcat :: Bundle a -> Bundle a -> Bundle a
+sconcat (Bundle (MStream stepL sL0) szL) (Bundle (MStream stepR sR0) szR) =
+  Bundle (MStream step (Left sL0)) sz
   where
     sz = case (szL, szR) of
       (Exact a, Exact b) -> Exact (a + b)
@@ -210,70 +325,70 @@ sconcat (Stream stepL sL0 szL) (Stream stepR sR0 szR) =
       (Max   a, Exact b) -> Max   (a + b)
       (Max   a, Max   b) -> Max   (a + b)
       _                  -> Unknown
-    step (Left s) = case stepL s of
-      Yield a s' -> Yield a (Left s')
-      Skip    s' -> Skip (Left s')
-      Done       -> Skip (Right sR0)
-    step (Right s) = case stepR s of
-      Yield a s' -> Yield a (Right s')
-      Skip    s' -> Skip (Right s')
-      Done       -> Done
+    step (Left s) = case unId (stepL s) of
+      Yield a s' -> Id (Yield a (Left s'))
+      Skip    s' -> Id (Skip (Left s'))
+      Done       -> Id (Skip (Right sR0))
+    step (Right s) = case unId (stepR s) of
+      Yield a s' -> Id (Yield a (Right s'))
+      Skip    s' -> Id (Skip (Right s'))
+      Done       -> Id Done
 {-# INLINE [1] sconcat #-}
 
 ------------------------------------------------------------------------
 -- Consumers
 ------------------------------------------------------------------------
 
-sfoldl' :: (b -> a -> b) -> b -> Stream a -> b
-sfoldl' f z0 (Stream step s0 _) = go z0 s0
+sfoldl' :: (b -> a -> b) -> b -> Bundle a -> b
+sfoldl' f z0 (Bundle (MStream step s0) _) = go z0 s0
   where
-    go !z s = case step s of
+    go !z s = case unId (step s) of
       Yield a s' -> go (f z a) s'
       Skip    s' -> go z s'
       Done       -> z
 {-# INLINE [1] sfoldl' #-}
 
-sifoldl' :: (b -> Int -> a -> b) -> b -> Stream a -> b
-sifoldl' f z0 (Stream step s0 _) = go z0 0 s0
+sifoldl' :: (b -> Int -> a -> b) -> b -> Bundle a -> b
+sifoldl' f z0 (Bundle (MStream step s0) _) = go z0 0 s0
   where
-    go !z !i s = case step s of
+    go !z !i s = case unId (step s) of
       Yield a s' -> go (f z i a) (i + 1) s'
       Skip    s' -> go z i s'
       Done       -> z
 {-# INLINE [1] sifoldl' #-}
 
-sfoldr :: (a -> b -> b) -> b -> Stream a -> b
-sfoldr f z (Stream step s0 _) = go s0
+sfoldr :: (a -> b -> b) -> b -> Bundle a -> b
+sfoldr f z (Bundle (MStream step s0) _) = go s0
   where
-    go s = case step s of
+    go s = case unId (step s) of
       Yield a s' -> f a (go s')
       Skip    s' -> go s'
       Done       -> z
 {-# INLINE [1] sfoldr #-}
 
-sifoldr :: (Int -> a -> b -> b) -> b -> Stream a -> b
-sifoldr f z (Stream step s0 _) = go 0 s0
+sifoldr :: (Int -> a -> b -> b) -> b -> Bundle a -> b
+sifoldr f z (Bundle (MStream step s0) _) = go 0 s0
   where
-    go !i s = case step s of
+    go !i s = case unId (step s) of
       Yield a s' -> f i a (go (i + 1) s')
       Skip    s' -> go i s'
       Done       -> z
 {-# INLINE [1] sifoldr #-}
 
-slength :: Stream a -> Int
+slength :: Bundle a -> Int
 slength = sfoldl' (\n _ -> n + 1) 0
 {-# INLINE slength #-}
 
-snull :: Stream a -> Bool
-snull (Stream step s0 _) = go s0
+snull :: Bundle a -> Bool
+snull (Bundle (MStream step s0) _) = go s0
   where
-    go s = case step s of
+    go s = case unId (step s) of
       Yield _ _ -> False
       Skip   s' -> go s'
       Done      -> True
 {-# INLINE snull #-}
 
-stoList :: Stream a -> [a]
+stoList :: Bundle a -> [a]
 stoList = sfoldr (:) []
 {-# INLINE stoList #-}
 
@@ -285,4 +400,10 @@ stoList = sfoldr (:) []
 "smap/smap"       forall f g s.  smap f (smap g s)       = smap (f . g) s
 "sfilter/sfilter" forall f g s.  sfilter f (sfilter g s) = sfilter (\x -> g x && f x) s
 "smap/sfilter"    forall f p s.  sfilter p (smap f s)    = smap f (sfilter (p . f) s)
+
+"inplace/inplace [pvector]"
+  forall (f1 :: forall m. Monad m => MStream m a -> MStream m a)
+         (f2 :: forall m. Monad m => MStream m a -> MStream m a)
+         g1 g2 s.
+  inplace f1 g1 (inplace f2 g2 s) = inplace (f1 . f2) (g1 . g2) s
   #-}
