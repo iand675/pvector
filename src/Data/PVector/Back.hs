@@ -780,9 +780,34 @@ filter p = filterDirect p
 {-# NOINLINE [1] filter #-}
 
 filterDirect :: (a -> Bool) -> Vector a -> Vector a
-filterDirect p v = create $ \mv ->
-  forI_ v $ \_ a -> when (p a) (mPush mv a)
+filterDirect p v
+  | n == 0 = empty
+  | otherwise = create $ \mv -> do
+      filterNode p mv (vShift v) (vRoot v)
+      filterChunk p mv (vTail v) 0 (sizeofSmallArray (vTail v))
+  where !n = vSize v
 {-# INLINE filterDirect #-}
+
+filterNode :: (a -> Bool) -> MVector s a -> Int -> Node a -> ST s ()
+filterNode _ _ _ Empty = pure ()
+filterNode p mv _ (Leaf arr) = filterChunk p mv arr 0 (sizeofSmallArray arr)
+filterNode p mv level (Internal arr) = do
+  let !n = sizeofSmallArray arr
+      go i | i >= n = pure ()
+           | otherwise = do
+               filterNode p mv (level - bfBits) (indexSmallArray arr i)
+               go (i + 1)
+  go 0
+
+filterChunk :: (a -> Bool) -> MVector s a -> SmallArray a -> Int -> Int -> ST s ()
+filterChunk p mv arr = go
+  where
+    go !i !limit
+      | i >= limit = pure ()
+      | otherwise = do
+          let !a = indexSmallArray arr i
+          when (p a) (mPush mv a)
+          go (i + 1) limit
 
 ifilter :: (Int -> a -> Bool) -> Vector a -> Vector a
 ifilter p v = create $ \mv ->
