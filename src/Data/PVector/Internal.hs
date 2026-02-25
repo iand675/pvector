@@ -29,8 +29,12 @@ module Data.PVector.Internal
   , foldrChunk32
   , mapChunk32
 
-    -- * Fused clone-and-set (Cmm primop)
+    -- * Fused clone-and-set
   , cloneAndSet32
+
+    -- * Unsafe node accessors (depth-invariant, skip tag check)
+  , unsafeNodeChildren
+  , unsafeLeafArray
 
     -- * Array helpers
   , emptyRoot
@@ -48,6 +52,7 @@ import Control.Monad.Primitive
 import Control.Monad.ST
 import Data.Bits
 import Data.Primitive.SmallArray
+import Unsafe.Coerce (unsafeCoerce)
 
 bfBits :: Int
 bfBits = 5
@@ -116,7 +121,7 @@ freezeNode (MInternal marr) = do
             go (i + 1)
   go 0
   Internal <$> unsafeFreezeSmallArray buf
-{-# INLINABLE freezeNode #-}
+{-# INLINEABLE freezeNode #-}
 
 editableInternal
   :: PrimMonad m
@@ -134,7 +139,7 @@ editableInternal (Frozen (Internal arr)) = do
   pure marr
 editableInternal (Frozen Empty) = newSmallArray bf (Frozen Empty)
 editableInternal _ = error "pvector: editableInternal on leaf node"
-{-# INLINABLE editableInternal #-}
+{-# INLINEABLE editableInternal #-}
 
 editableLeaf
   :: PrimMonad m
@@ -143,7 +148,7 @@ editableLeaf
 editableLeaf (MLeaf arr) = pure arr
 editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 bf
 editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
-{-# INLINABLE editableLeaf #-}
+{-# INLINEABLE editableLeaf #-}
 
 ------------------------------------------------------------------------
 -- In-place mutable trie operations
@@ -178,7 +183,7 @@ mMapNodeInPlace f shift (Frozen (Internal arr)) = do
             go (i + 1)
   go 0
   pure (MInternal marr)
-{-# INLINABLE mMapNodeInPlace #-}
+{-# INLINEABLE mMapNodeInPlace #-}
 
 mapMutableArr :: PrimMonad m => (a -> a) -> SmallMutableArray (PrimState m) a -> Int -> Int -> m ()
 mapMutableArr f arr = go
@@ -240,6 +245,26 @@ mapChunk32 f arr = runST $ do
   go 0
   unsafeFreezeSmallArray marr
 {-# INLINE mapChunk32 #-}
+
+------------------------------------------------------------------------
+-- Unsafe node accessors
+------------------------------------------------------------------------
+
+-- | Extract the child array from a Node that is known to be Internal.
+-- Uses a single-alternative case to hint to GHC that only Internal
+-- is possible, which can eliminate the tag check in optimized code.
+unsafeNodeChildren :: Node a -> SmallArray (Node a)
+unsafeNodeChildren n = case n of
+  Internal arr -> arr
+  _ -> undefinedElem  -- unreachable; marked as bottom so GHC eliminates it
+{-# INLINE unsafeNodeChildren #-}
+
+-- | Extract the element array from a Node that is known to be a Leaf.
+unsafeLeafArray :: Node a -> SmallArray a
+unsafeLeafArray n = case n of
+  Leaf arr -> arr
+  _ -> undefinedElem
+{-# INLINE unsafeLeafArray #-}
 
 ------------------------------------------------------------------------
 -- Fused clone-and-set

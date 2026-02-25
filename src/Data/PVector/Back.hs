@@ -774,17 +774,43 @@ update i x v
 
 -- Path-copy update: clones each node on the root-to-leaf path.
 -- Uses cloneAndSet32 which avoids sizeofSmallArray overhead.
+-- | Path-copy update with unrolled descent for depth 1 and 2.
 updateNodeST :: Int -> Int -> a -> Node a -> Node a
-updateNodeST !shift !i x = go shift
+updateNodeST !shift !i x root = case root of
+  Internal arr0
+    | shift == bfBits ->
+        -- Depth 1: root children are leaves
+        let !si0 = indexAtLevel i shift
+            !child = indexSmallArray arr0 si0
+            !child' = case child of
+              Leaf la -> Leaf (cloneAndSet32 la (i .&. bfMask) x)
+              _ -> error "pvector: update invariant"
+        in Internal (cloneAndSet32 arr0 si0 child')
+    | shift == 2 * bfBits ->
+        -- Depth 2: root -> internal -> leaf
+        let !si0 = indexAtLevel i shift
+            !mid = indexSmallArray arr0 si0
+            !mid' = case mid of
+              Internal arr1 ->
+                let !si1 = indexAtLevel i bfBits
+                    !child = indexSmallArray arr1 si1
+                    !child' = case child of
+                      Leaf la -> Leaf (cloneAndSet32 la (i .&. bfMask) x)
+                      _ -> error "pvector: update invariant"
+                in Internal (cloneAndSet32 arr1 si1 child')
+              _ -> error "pvector: update invariant"
+        in Internal (cloneAndSet32 arr0 si0 mid')
+    | otherwise -> goDeep shift root
+  _ -> goDeep shift root
   where
-    go !level (Internal arr) =
+    goDeep !level (Internal arr) =
       let !subIdx = indexAtLevel i level
           !child  = indexSmallArray arr subIdx
-          !child' = go (level - bfBits) child
+          !child' = goDeep (level - bfBits) child
       in Internal (cloneAndSet32 arr subIdx child')
-    go _ (Leaf arr) =
+    goDeep _ (Leaf arr) =
       Leaf (cloneAndSet32 arr (i .&. bfMask) x)
-    go _ Empty = error "pvector: updateNodeST hit Empty"
+    goDeep _ Empty = error "pvector: updateNodeST hit Empty"
 {-# INLINE updateNodeST #-}
 
 -- | Bulk update from a list of (index, value) pairs.
@@ -827,6 +853,7 @@ mapDirect f v
     !newRoot = mapNode (vShift v) f (vRoot v)
 {-# INLINE mapDirect #-}
 
+{-# INLINEABLE mapNode #-}
 mapNode :: Int -> (a -> b) -> Node a -> Node b
 mapNode _ _ Empty = Empty
 mapNode _ f (Leaf arr) = Leaf (mapChunk32 f arr)
@@ -948,6 +975,7 @@ filterDirect p v
   where !n = vSize v
 {-# INLINE filterDirect #-}
 
+{-# INLINEABLE filterNode #-}
 filterNode :: (a -> Bool) -> MVector s a -> Int -> Node a -> ST s ()
 filterNode _ _ _ Empty = pure ()
 filterNode p mv _ (Leaf arr) = filterChunk p mv arr 0 bf
@@ -959,6 +987,7 @@ filterNode p mv level (Internal arr) = do
                go (i + 1)
   go 0
 
+{-# INLINEABLE filterChunk #-}
 filterChunk :: (a -> Bool) -> MVector s a -> SmallArray a -> Int -> Int -> ST s ()
 filterChunk p mv arr = go
   where
@@ -1055,11 +1084,84 @@ foldl' :: (b -> a -> b) -> b -> Vector a -> b
 foldl' f = \ !z0 v ->
   if vSize v == 0
   then z0
-  else goArr f (goNode f z0 (vShift v) (vRoot v)) (vTail v) 0 (sizeofSmallArray (vTail v))
+  else let fchunk = foldlChunk32 f
+           ftail  = goArr f
+       in ftail (goNodeWith fchunk z0 (vShift v) (vRoot v))
+               (vTail v) 0 (sizeofSmallArray (vTail v))
 {-# INLINE foldl' #-}
 
+-- | Walk the trie and fold over all leaf arrays.
+-- Unrolls depth-1 and depth-2 cases to avoid per-child Node pattern match.
+-- | Walk the trie applying a pre-specialized chunk fold at each leaf.
+-- The chunk fold @fchunk@ is applied by the INLINE'd caller with @f@
+-- already baked in, so GHC specializes the inner loop.
+goNodeWith :: (b -> SmallArray a -> b) -> b -> Int -> Node a -> b
+goNodeWith fchunk !z0 !level0 node0 = case node0 of
+  Empty -> z0
+  Leaf arr -> fchunk z0 arr
+  Internal arr0
+    | level0 == bfBits ->
+        goLvs z0 arr0 0
+    | level0 == 2 * bfBits ->
+        goInts z0 arr0 0
+    | otherwise ->
+        goDeep z0 level0 node0
+  where
+    goLvs !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Leaf la  -> goLvs (fchunk z la) arr (i + 1)
+          Empty    -> goLvs z arr (i + 1)
+          _        -> goLvs z arr (i + 1)
+    goInts !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Internal inner -> goInts (goLvs z inner 0) arr (i + 1)
+          Empty          -> goInts z arr (i + 1)
+          _              -> goInts z arr (i + 1)
+    goDeep !z !_ Empty = z
+    goDeep !z !_ (Leaf arr) = fchunk z arr
+    goDeep !z !level (Internal arr) = goC z 0
+      where
+        goC !z' !i
+          | i >= bf   = z'
+          | otherwise = goC (goDeep z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
+{-# INLINEABLE goNodeWith #-}
+
+{-# INLINEABLE goNode #-}
 goNode :: (b -> a -> b) -> b -> Int -> Node a -> b
-goNode f = go
+goNode f !z0 !level0 node0 = case node0 of
+  Empty -> z0
+  Leaf arr -> foldlChunk32 f z0 arr
+  Internal arr0
+    | level0 == bfBits ->
+        -- Depth 1: all children are Leaf
+        goLeaves z0 arr0 0
+    | level0 == 2 * bfBits ->
+        -- Depth 2: children are Internal whose children are Leaf
+        goInternals z0 arr0 0
+    | otherwise ->
+        goGeneric f z0 level0 node0
+  where
+    -- Fold over 32 Leaf children (depth 1)
+    goLeaves !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Leaf la  -> goLeaves (foldlChunk32 f z la) arr (i + 1)
+          Empty    -> goLeaves z arr (i + 1)
+          _        -> goLeaves z arr (i + 1)
+
+    -- Fold over 32 Internal children each containing Leaf children (depth 2)
+    goInternals !z !arr !i
+      | i >= bf   = z
+      | otherwise = case indexSmallArray arr i of
+          Internal inner -> goInternals (goLeaves z inner 0) arr (i + 1)
+          Empty          -> goInternals z arr (i + 1)
+          _              -> goInternals z arr (i + 1)
+
+-- Generic recursive fold for depth >= 3
+goGeneric :: (b -> a -> b) -> b -> Int -> Node a -> b
+goGeneric f = go
   where
     go !z !_ Empty = z
     go !z !_ (Leaf arr) = foldlChunk32 f z arr
@@ -1068,8 +1170,7 @@ goNode f = go
         goC !z' !i
           | i >= bf   = z'
           | otherwise = goC (go z' (level - bfBits) (indexSmallArray arr i)) (i + 1)
-{-# SPECIALIZE goNode :: (Int -> Int -> Int) -> Int -> Int -> Node Int -> Int #-}
-{-# SPECIALIZE goNode :: (Int -> a -> Int) -> Int -> Int -> Node a -> Int #-}
+{-# INLINEABLE goGeneric #-}
 
 goArr :: (b -> a -> b) -> b -> SmallArray a -> Int -> Int -> b
 goArr f = go
@@ -1078,7 +1179,6 @@ goArr f = go
       | i >= limit = z
       | otherwise  = go (f z (indexSmallArray arr i)) arr (i + 1) limit
 {-# INLINE goArr #-}
-{-# SPECIALIZE goArr :: (Int -> Int -> Int) -> Int -> SmallArray Int -> Int -> Int -> Int #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
 foldlDirect = foldl'
@@ -1534,6 +1634,7 @@ forI_ v f
   where !n = vSize v
 {-# INLINE forI_ #-}
 
+{-# INLINEABLE forNodeI_ #-}
 forNodeI_ :: (Int -> a -> ST s ()) -> Int -> Int -> Node a -> ST s Int
 forNodeI_ _ off _ Empty = pure off
 forNodeI_ f off _ (Leaf arr) = forArrI_ f off arr 0 bf
@@ -1545,6 +1646,7 @@ forNodeI_ f off level (Internal arr) = do
             go o' (i + 1)
   go off 0
 
+{-# INLINEABLE forArrI_ #-}
 forArrI_ :: (Int -> a -> ST s ()) -> Int -> SmallArray a -> Int -> Int -> ST s Int
 forArrI_ f = go
   where
@@ -1561,6 +1663,7 @@ forEach_ v f
       forArr_ f (vTail v) 0 (sizeofSmallArray (vTail v))
 {-# INLINE forEach_ #-}
 
+{-# INLINEABLE forNode_ #-}
 forNode_ :: (a -> ST s ()) -> Int -> Node a -> ST s ()
 forNode_ _ _ Empty = pure ()
 forNode_ f _ (Leaf arr) = forArr_ f arr 0 bf
@@ -1570,6 +1673,7 @@ forNode_ f level (Internal arr) = do
         | otherwise = forNode_ f (level - bfBits) (indexSmallArray arr i) >> go (i + 1)
   go 0
 
+{-# INLINEABLE forArr_ #-}
 forArr_ :: (a -> ST s ()) -> SmallArray a -> Int -> Int -> ST s ()
 forArr_ f arr = go
   where
@@ -2067,13 +2171,33 @@ liftSmap f (MStream step s0) = MStream step' s0
 -- Internal tree operations
 ------------------------------------------------------------------------
 
+-- | Navigate the trie to the leaf containing index i.
+-- Unrolls the first 3 levels of descent (covers vectors up to 32^4 = ~1M).
 leafFor :: Int -> Int -> Node a -> SmallArray a
-leafFor = go
+leafFor !level0 !i node0 = case node0 of
+  Leaf arr -> arr
+  Internal arr0
+    | level0 == bfBits ->
+        -- Depth 1: root children are leaves
+        case indexSmallArray arr0 (indexAtLevel i level0) of
+          Leaf arr -> arr
+          _ -> error "pvector: leafFor invariant"
+    | level0 == 2 * bfBits ->
+        -- Depth 2: root → internal → leaf
+        case indexSmallArray arr0 (indexAtLevel i level0) of
+          Internal arr1 ->
+            case indexSmallArray arr1 (indexAtLevel i bfBits) of
+              Leaf arr -> arr
+              _ -> error "pvector: leafFor invariant"
+          _ -> error "pvector: leafFor invariant"
+    | otherwise -> goDeep level0 i node0
+  Empty -> error "pvector: leafFor hit Empty"
   where
-    go !level !i (Internal arr) = go (level - bfBits) i (indexSmallArray arr (indexAtLevel i level))
-    go _      _ (Leaf arr)      = arr
-    go _      _ Empty           = error "pvector: leafFor hit Empty node"
-{-# INLINE leafFor #-}
+    goDeep !level !i (Internal arr) =
+      goDeep (level - bfBits) i (indexSmallArray arr (indexAtLevel i level))
+    goDeep _ _ (Leaf arr) = arr
+    goDeep _ _ Empty = error "pvector: leafFor hit Empty"
+{-# INLINEABLE leafFor #-}
 
 updateNode :: Int -> Int -> a -> Node a -> Node a
 updateNode = go
