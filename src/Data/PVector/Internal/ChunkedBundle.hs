@@ -51,6 +51,12 @@ module Data.PVector.Internal.ChunkedBundle
   , cbAny
   , cbEq
 
+    -- * Rechunking (with hysteresis)
+  , cbRechunk
+
+    -- * Batch operations
+  , cbBatchSnoc
+
     -- * Materialization
   , cbToChunkList
   ) where
@@ -380,6 +386,120 @@ cbToChunkList (ChunkedBundle step s0 _) = go s0
       CDone           -> []
 
 ------------------------------------------------------------------------
+-- Rechunking with hysteresis (Chunked Sequences secondary-buffer trick)
+------------------------------------------------------------------------
+
+-- | Rechunk a bundle to produce full-width chunks (of @targetSize@ elements).
+--
+-- After operations like 'cbFilter' that produce irregular-sized chunks,
+-- 'cbRechunk' normalizes them before tree materialization.
+--
+-- Uses the /secondary head chunk/ trick from Acar et al.: a pending buffer
+-- that is always either empty or full protects against pathological
+-- alternating-boundary patterns that would otherwise cause repeated
+-- allocation/deallocation at the chunk boundary. Elements accumulate in
+-- a mutable buffer; only when the buffer reaches @targetSize@ is it
+-- frozen and yielded.  The final partial buffer is yielded at the end.
+cbRechunk :: Int -> ChunkedBundle a -> ChunkedBundle a
+cbRechunk targetSz (ChunkedBundle step s0 sz) =
+  ChunkedBundle step' (s0, Nothing, 0 :: Int) sz
+  where
+    step' (s, Nothing, _) = case step s of
+      CYield chunk s'
+        | chunkLength chunk == targetSz -> CYield chunk (s', Nothing, 0)
+        | chunkLength chunk > targetSz ->
+            -- Oversized chunk: split it
+            let !c1 = Chunk (chunkArray chunk) (chunkOffset chunk) targetSz
+                !c2off = chunkOffset chunk + targetSz
+                !c2len = chunkLength chunk - targetSz
+            in CYield c1 (s', Just (Chunk (chunkArray chunk) c2off c2len), 0)
+        | otherwise ->
+            -- Undersized: start accumulating into a new buffer
+            CSkip (s', Just chunk, chunkLength chunk)
+      CSkip s' -> CSkip (s', Nothing, 0)
+      CDone -> CDone
+
+    step' (s, Just pending, !accLen) = case step s of
+      CYield chunk s' ->
+        let !newLen = accLen + chunkLength chunk
+        in if newLen >= targetSz
+           then
+             -- Enough to emit a full chunk; materialize pending + prefix of chunk
+             let !emitted = materializeConcat targetSz pending chunk
+                 !leftover = newLen - targetSz
+                 !nextPending
+                   | leftover > 0 =
+                       let !off2 = chunkOffset chunk + chunkLength chunk - leftover
+                       in Just (Chunk (chunkArray chunk) off2 leftover)
+                   | otherwise = Nothing
+             in CYield emitted (s', nextPending, leftover)
+           else
+             -- Still accumulating
+             let !merged = mergeChunks pending chunk
+             in CSkip (s', Just merged, newLen)
+      CSkip s' -> CSkip (s', Just pending, accLen)
+      CDone
+        | accLen > 0 -> CYield pending (s, Nothing, 0)
+        | otherwise -> CDone
+{-# INLINE [1] cbRechunk #-}
+
+-- Materialize two chunks into one SmallArray of exactly @n@ elements.
+materializeConcat :: Int -> Chunk a -> Chunk a -> Chunk a
+materializeConcat n (Chunk a1 o1 l1) (Chunk a2 o2 _) = runST $ do
+  let !take2 = n - l1
+  marr <- newSmallArray n uninit
+  copySmallArray marr 0 a1 o1 l1
+  copySmallArray marr l1 a2 o2 take2
+  frozen <- unsafeFreezeSmallArray marr
+  pure $! Chunk frozen 0 n
+  where uninit = error "pvector: materializeConcat"
+{-# INLINE materializeConcat #-}
+
+-- Merge two chunks into one (used when accumulating small chunks).
+mergeChunks :: Chunk a -> Chunk a -> Chunk a
+mergeChunks (Chunk a1 o1 l1) (Chunk a2 o2 l2) = runST $ do
+  let !total = l1 + l2
+  marr <- newSmallArray total uninit
+  copySmallArray marr 0 a1 o1 l1
+  copySmallArray marr l1 a2 o2 l2
+  frozen <- unsafeFreezeSmallArray marr
+  pure $! Chunk frozen 0 total
+  where uninit = error "pvector: mergeChunks"
+{-# INLINE mergeChunks #-}
+
+------------------------------------------------------------------------
+-- Batch snoc: coalesce consecutive appends
+------------------------------------------------------------------------
+
+-- | Append a list of elements as new chunks after the existing bundle.
+-- Consecutive snoc operations should be collected into a list and
+-- passed here, producing one bulk append instead of k individual tree
+-- path copies.
+cbBatchSnoc :: [a] -> ChunkedBundle a -> ChunkedBundle a
+cbBatchSnoc [] b = b
+cbBatchSnoc new (ChunkedBundle step s0 sz) =
+  ChunkedBundle step' (Left s0) sz'
+  where
+    !newChunks = chunkify 32 new
+    sz' = case sz of
+      CExact m -> CExact (m + Prelude.length new)
+      _        -> CUnknown
+    step' (Left s) = case step s of
+      CYield c s' -> CYield c (Left s')
+      CSkip s'    -> CSkip (Left s')
+      CDone       -> CSkip (Right newChunks)
+    step' (Right [])     = CDone
+    step' (Right (c:cs)) = CYield (fullChunk c) (Right cs)
+{-# INLINE [1] cbBatchSnoc #-}
+
+chunkify :: Int -> [a] -> [SmallArray a]
+chunkify _ [] = []
+chunkify n xs =
+  let (these, rest) = Prelude.splitAt n xs
+      !arr = smallArrayFromList these
+  in arr : chunkify n rest
+
+------------------------------------------------------------------------
 -- Rewrite rules: chunk-level fusion
 ------------------------------------------------------------------------
 
@@ -416,5 +536,21 @@ cbToChunkList (ChunkedBundle step s0 _) = go s0
 -- Map through take/drop: push map inside (cheaper to map fewer elements)
 "cbMap/cbTake" forall f n b. cbMap f (cbTake n b) = cbTake n (cbMap f b)
 "cbMap/cbDrop" forall f n b. cbMap f (cbDrop n b) = cbDrop n (cbMap f b)
+
+-- Rechunk elision: folds don't need regular chunk sizes
+"cbFoldl'/cbRechunk" forall f z n b.
+  cbFoldl' f z (cbRechunk n b) = cbFoldl' f z b
+"cbFoldr/cbRechunk" forall f z n b.
+  cbFoldr f z (cbRechunk n b) = cbFoldr f z b
+"cbAll/cbRechunk" forall p n b.
+  cbAll p (cbRechunk n b) = cbAll p b
+"cbAny/cbRechunk" forall p n b.
+  cbAny p (cbRechunk n b) = cbAny p b
+"cbLength/cbRechunk" forall n b.
+  cbLength (cbRechunk n b) = cbLength b
+
+-- Batch snoc coalescing: multiple batchSnocs merge into one
+"cbBatchSnoc/cbBatchSnoc" forall xs ys b.
+  cbBatchSnoc xs (cbBatchSnoc ys b) = cbBatchSnoc (ys Prelude.++ xs) b
 
   #-}

@@ -403,6 +403,34 @@ backVectorTests = testGroup "Data.PVector.Back"
                  (Gen.list (Range.linear 0 100) (Gen.int (Range.linear 0 10000)))
         let v = V.concat (Prelude.map V.fromList xss)
         V.toList v Hedgehog.=== Prelude.concat xss
+    , testProperty "batch update (//) matches sequential update" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 200) (Gen.int (Range.linear 0 10000))
+        let n = Prelude.length xs
+            v = V.fromList xs
+        numUpdates <- Hedgehog.forAll $ Gen.int (Range.linear 0 (min 20 n))
+        indices <- Hedgehog.forAll $ Gen.list (Range.constant numUpdates numUpdates) (Gen.int (Range.linear 0 (n - 1)))
+        vals <- Hedgehog.forAll $ Gen.list (Range.constant numUpdates numUpdates) (Gen.int (Range.linear 0 10000))
+        let updates = Prelude.zip indices vals
+            vBatch = v V.// updates
+            vSeq = Prelude.foldl (\acc (i, x) -> V.update i x acc) v updates
+        V.toList vBatch Hedgehog.=== V.toList vSeq
+    , testProperty "batch update (//) with duplicates keeps last" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 100) (Gen.int (Range.linear 0 10000))
+        let n = Prelude.length xs
+            v = V.fromList xs
+        i <- Hedgehog.forAll $ Gen.int (Range.linear 0 (n - 1))
+        val1 <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        val2 <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v' = v V.// [(i, val1), (i, val2)]
+        V.index v' i Hedgehog.=== val2
+    , testProperty "foldl' . map == foldl' (f . g)" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 100))
+        let v = V.fromList xs
+        V.foldl' (+) 0 (V.map (*2) v) Hedgehog.=== L.foldl' (\a x -> a + x*2) 0 xs
+    , testProperty "foldl' . filter == filtered foldl'" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 100))
+        let v = V.fromList xs
+        V.foldl' (+) 0 (V.filter even v) Hedgehog.=== L.foldl' (\a x -> if even x then a + x else a) 0 xs
     ]
   ]
 

@@ -803,15 +803,112 @@ updateTree !shift !i x node = case node of
   Empty -> error "pvector: updateTree hit Empty"
 {-# INLINEABLE updateTree #-}
 
--- | Bulk update from a list of (index, value) pairs. When the updates
--- are sorted by index, this coalesces updates that hit the same leaf
--- into a single path copy, reducing from O(k * log n) to O(k + log n)
--- for k updates within the same leaf.
+-- | Bulk update from a list of (index, value) pairs.
+--
+-- Sorts the updates by index so that multiple updates hitting the same
+-- leaf are coalesced into a single path-copy.  For @k@ updates that all
+-- land in distinct leaves this is @O(k log n)@; when several cluster in
+-- the same leaf the shared path prefix is copied only once.
 (//) :: Vector a -> [(Int, a)] -> Vector a
 xs // [] = xs
 xs // [(i, x)] = update i x xs
-xs // ps = Prelude.foldl (\v (i, x) -> update i x v) xs ps
+xs // ps = batchUpdate xs (sortByFst ps)
 {-# INLINE [1] (//) #-}
+
+-- | Apply a list of updates sorted by index.  Adjacent updates in the
+-- same region (prefix / tree-leaf / tail) share the single clone.
+batchUpdate :: Vector a -> [(Int, a)] -> Vector a
+batchUpdate v [] = v
+batchUpdate v ps = v { vPrefix = newPrefix, vRoot = newRoot, vTail = newTail }
+  where
+    !pLen = sizeofSmallArray (vPrefix v)
+    !tLen = sizeofSmallArray (vTail v)
+    !n    = vSize v
+    !tStart = n - tLen
+
+    (!prefixUpdates, rest1) = Prelude.span (\(i,_) -> i < pLen) ps
+    (!treeUpdates,   rest2) = Prelude.span (\(i,_) -> i < tStart) rest1
+    !tailUpdates = rest2
+
+    !newPrefix
+      | Prelude.null prefixUpdates = vPrefix v
+      | otherwise = applyUpdates (vPrefix v) 0 prefixUpdates
+
+    !newTail
+      | Prelude.null tailUpdates = vTail v
+      | otherwise = applyUpdates (vTail v) tStart tailUpdates
+
+    !newRoot
+      | Prelude.null treeUpdates = vRoot v
+      | otherwise = batchUpdateTree (vShift v) pLen (vRoot v) treeUpdates
+
+-- | Apply sorted updates to a SmallArray. @base@ is subtracted from each
+-- index to get the local position in the array.
+applyUpdates :: SmallArray a -> Int -> [(Int, a)] -> SmallArray a
+applyUpdates arr base ups = runST $ do
+  marr <- thawSmallArray arr 0 (sizeofSmallArray arr)
+  let go [] = pure ()
+      go ((i, x) : rest) = writeSmallArray marr (i - base) x >> go rest
+  go ups
+  unsafeFreezeSmallArray marr
+{-# INLINE applyUpdates #-}
+
+-- | Walk the tree, applying sorted updates.  At each internal node we
+-- partition the remaining updates among children and only clone children
+-- that actually receive updates.
+batchUpdateTree :: Int -> Int -> Node a -> [(Int, a)] -> Node a
+batchUpdateTree !_ !_ node [] = node
+batchUpdateTree !shift !base node ups = case node of
+  Leaf arr ->
+    Leaf (applyUpdates arr base ups)
+  Internal arr ->
+    let !childSz = unsafeShiftL 1 shift
+        go !i !remaining
+          | i >= sizeofSmallArray arr || Prelude.null remaining = []
+          | otherwise =
+              let !childBase = base + i * childSz
+                  !childEnd  = childBase + childSz
+                  (!here, !rest) = Prelude.span (\(idx,_) -> idx < childEnd) remaining
+              in (i, here) : go (i + 1) rest
+        groups = go 0 ups
+        applyGroup arr' (ci, cUps)
+          | Prelude.null cUps = arr'
+          | otherwise =
+              let !child = indexSmallArray arr' ci
+                  !child' = batchUpdateTree (shift - bfBits) (base + ci * childSz) child cUps
+              in cloneAndSet arr' ci child'
+    in Internal (Prelude.foldl applyGroup arr groups)
+  Relaxed arr sizes ->
+    let findChild !ci !remaining
+          | ci >= sizeofSmallArray arr || Prelude.null remaining = []
+          | otherwise =
+              let !childEnd = base + indexPrimArray sizes ci
+                  (!here, !rest) = Prelude.span (\(idx,_) -> idx < childEnd) remaining
+                  !childBase = if ci == 0 then base else base + indexPrimArray sizes (ci - 1)
+              in (ci, childBase, here) : findChild (ci + 1) rest
+        groups = findChild 0 ups
+        applyGroupR arr' (ci, cBase, cUps)
+          | Prelude.null cUps = arr'
+          | otherwise =
+              let !child = indexSmallArray arr' ci
+                  !child' = batchUpdateTree (shift - bfBits) cBase child cUps
+              in cloneAndSet arr' ci child'
+    in Relaxed (Prelude.foldl applyGroupR arr groups) sizes
+  Empty -> error "pvector: batchUpdateTree hit Empty"
+
+-- | Insertion sort by first element — fine for the typical small update lists.
+sortByFst :: [(Int, a)] -> [(Int, a)]
+sortByFst [] = []
+sortByFst [x] = [x]
+sortByFst xs = mergeSorted (sortByFst l) (sortByFst r)
+  where
+    !half = Prelude.length xs `div` 2
+    (l, r) = Prelude.splitAt half xs
+    mergeSorted [] bs = bs
+    mergeSorted as [] = as
+    mergeSorted (a@(ai,_):as) (b@(bi,_):bs)
+      | ai <= bi  = a : mergeSorted as (b:bs)
+      | otherwise = b : mergeSorted (a:as) bs
 
 adjust :: (a -> a) -> Int -> Vector a -> Vector a
 adjust f i v
@@ -2233,16 +2330,22 @@ collectChunks v = prefix (treeChunks (vShift v) (vRoot v) (suffix []))
       | otherwise = treeChunks (sh - bfBits) (indexSmallArray arr i)
                                 (childChunks sh arr (i + 1) rest)
 
--- | Rebuild a Vector from a ChunkedBundle by pushing chunk elements.
+-- | Rebuild a Vector from a ChunkedBundle.  Full-width chunks that
+-- start at offset 0 are pushed with 'mPushChunk' (O(1) per chunk
+-- instead of O(bf) element pushes).
 cunstream :: ChunkedBundle a -> Vector a
 cunstream cb = create $ \mv ->
   let chunks = CB.cbToChunkList cb
       go [] = pure ()
       go (Chunk arr off len : rest) = do
-        let pushElems !i
-              | i >= len  = pure ()
-              | otherwise = mPush mv (indexSmallArray arr (off + i)) >> pushElems (i + 1)
-        pushElems 0
+        st <- getMV mv
+        if off == 0 && len == sizeofSmallArray arr && len == bf && mvTailSize st == 0
+          then mPushChunk mv arr
+          else do
+            let pushElems !i
+                  | i >= len  = pure ()
+                  | otherwise = mPush mv (indexSmallArray arr (off + i)) >> pushElems (i + 1)
+            pushElems 0
         go rest
   in go chunks
 {-# INLINE [0] cunstream #-}
@@ -2452,15 +2555,16 @@ liftSmap f (MStream step s0) = MStream step' s0
 -- === Chunk-level fusion rules ===
 -- These use cstream/cunstream to keep operations at the SmallArray level,
 -- avoiding element-by-element deforestation that destroys cache locality.
--- NOTE: These are currently disabled pending investigation of phase
--- interactions with the element-level rules above. The chunk-level
--- framework (ChunkedBundle) can be used directly via cstream.
---
--- "pvector/foldlDirect/mapDirect [chunk-fused]" forall f g z v.
---   foldlDirect f z (mapDirect g v) = CB.cbFoldl' (\acc x -> f acc (g x)) z (cstream v)
---
--- "pvector/foldlDirect/filterDirect [chunk-fused]" forall f z p v.
---   foldlDirect f z (filterDirect p v) = CB.cbFoldl' (\acc x -> if p x then f acc x else acc) z (cstream v)
+-- They fire at phase [1] alongside the "direct" fallbacks, matching the
+-- composed pattern before individual operations inline.
+
+-- Chunk-level foldl' . map: tight inner loop over each chunk array
+"pvector/foldlDirect/mapDirect [chunk-fused]" [1] forall f g z v.
+  foldlDirect f z (mapDirect g v) = CB.cbFoldl' (\acc x -> f acc (g x)) z (cstream v)
+
+-- Chunk-level foldl' . filter: fold with inline predicate, no alloc
+"pvector/foldlDirect/filterDirect [chunk-fused]" [1] forall f z p v.
+  foldlDirect f z (filterDirect p v) = CB.cbFoldl' (\acc x -> if p x then f acc x else acc) z (cstream v)
 
   #-}
 
