@@ -1823,14 +1823,14 @@ consLeafToTree :: Int -> Node a -> Node a -> (Int, Node a)
 consLeafToTree !shift leaf root = case root of
   Empty -> (bfBits, leaf)
   Leaf _ ->
-    -- Root is a leaf, create an internal node with two leaves
+    -- Root is a single leaf; combine into an Internal node at shift bfBits
     let !arr = runST $ do
           a <- newSmallArray 2 Empty
           writeSmallArray a 0 leaf
           writeSmallArray a 1 root
           unsafeFreezeSmallArray a
         !sizes = computeSizeTable bfBits arr
-    in (bfBits + bfBits, mkRelaxed arr sizes)
+    in (bfBits, mkRelaxed arr sizes)
   Internal arr ->
     let !nc = sizeofSmallArray arr
     in if shift == bfBits
