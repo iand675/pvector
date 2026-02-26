@@ -666,17 +666,17 @@ index v i
   | i < 0 || i >= vSize v = error $ "Data.PVector.Back.index: " Prelude.++ show i
                                   Prelude.++ " out of bounds [0," Prelude.++ show (vSize v) Prelude.++ ")"
   | otherwise = unsafeIndex v i
-{-# INLINE index #-}
+{-# INLINE [1] index #-}
 
 (!) :: Vector a -> Int -> a
 (!) = index
-{-# INLINE (!) #-}
+{-# INLINE [1] (!) #-}
 
 (!?) :: Vector a -> Int -> Maybe a
 (!?) v i
   | i < 0 || i >= vSize v = Nothing
   | otherwise = Just $! unsafeIndex v i
-{-# INLINE (!?) #-}
+{-# INLINE [1] (!?) #-}
 
 unsafeIndex :: Vector a -> Int -> a
 unsafeIndex v i
@@ -684,19 +684,19 @@ unsafeIndex v i
   | otherwise    = indexSmallArray (leafFor (vShift v) i (vRoot v)) (i .&. bfMask)
   where
     !tailOff = tailOffset (vSize v)
-{-# INLINE unsafeIndex #-}
+{-# INLINE [1] unsafeIndex #-}
 
 head :: Vector a -> a
 head v
   | vSize v == 0 = error "Data.PVector.Back.head: empty"
   | otherwise     = unsafeIndex v 0
-{-# INLINE head #-}
+{-# INLINE [1] head #-}
 
 last :: Vector a -> a
 last v
   | vSize v == 0 = error "Data.PVector.Back.last: empty"
   | otherwise     = indexSmallArray (vTail v) (sizeofSmallArray (vTail v) - 1)
-{-# INLINE last #-}
+{-# INLINE [1] last #-}
 
 indexM :: Monad m => Vector a -> Int -> m a
 indexM v i = index v i `seq` pure (index v i)
@@ -723,16 +723,24 @@ slice i n v
 {-# INLINE slice #-}
 
 init :: Vector a -> Vector a
-init v = case unsnoc v of
+init v = initDirect v
+{-# NOINLINE [1] init #-}
+
+initDirect :: Vector a -> Vector a
+initDirect v = case unsnoc v of
   Nothing    -> error "Data.PVector.Back.init: empty"
   Just (v',_) -> v'
-{-# INLINE init #-}
+{-# INLINE initDirect #-}
 
 tail :: Vector a -> Vector a
-tail v
+tail v = tailDirect v
+{-# NOINLINE [1] tail #-}
+
+tailDirect :: Vector a -> Vector a
+tailDirect v
   | vSize v == 0 = error "Data.PVector.Back.tail: empty"
-  | otherwise     = drop 1 v
-{-# INLINE tail #-}
+  | otherwise     = dropDirect 1 v
+{-# INLINE tailDirect #-}
 
 take :: Int -> Vector a -> Vector a
 take n v = takeDirect n v
@@ -1012,11 +1020,23 @@ filterDirect p v
   | vSize v == 0 = empty
   | otherwise = create $ \mv -> do
       goNode (vShift v) (vRoot v) mv
-      goChunk (vTail v) 0 (sizeofSmallArray (vTail v)) mv
+      let !tailArr = vTail v
+          !tailSz = sizeofSmallArray tailArr
+      if tailSz == bf
+        then goFullChunk tailArr mv
+        else goFilterChunk tailArr 0 tailSz mv
   where
+    allPassChunk :: SmallArray a -> Bool
+    allPassChunk !arr = go 0
+      where
+        go !i
+          | i >= bf = True
+          | p (indexSmallArray arr i) = go (i + 1)
+          | otherwise = False
+
     goNode :: Int -> Node a -> MVector s a -> ST s ()
     goNode !_ Empty !_ = pure ()
-    goNode !_ (Leaf arr) !mv = goChunk arr 0 bf mv
+    goNode !_ (Leaf arr) !mv = goFullChunk arr mv
     goNode !level (Internal arr) !mv = do
       let go i | i >= bf   = pure ()
                | otherwise = do
@@ -1024,13 +1044,29 @@ filterDirect p v
                    go (i + 1)
       go 0
 
-    goChunk :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
-    goChunk !arr !i !limit !mv
+    goFullChunk :: SmallArray a -> MVector s a -> ST s ()
+    goFullChunk !arr !mv
+      | allPassChunk arr = do
+          st <- getMV mv
+          if mvTailSize st == 0
+            then mPushChunk mv arr
+            else pushAllChunk arr mv
+      | otherwise = goFilterChunk arr 0 bf mv
+
+    pushAllChunk :: SmallArray a -> MVector s a -> ST s ()
+    pushAllChunk !arr !mv = go 0
+      where
+        go !i
+          | i >= bf = pure ()
+          | otherwise = mPush mv (indexSmallArray arr i) >> go (i + 1)
+
+    goFilterChunk :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
+    goFilterChunk !arr !i !limit !mv
       | i >= limit = pure ()
       | otherwise = do
           let !a = indexSmallArray arr i
           when (p a) (mPush mv a)
-          goChunk arr (i + 1) limit mv
+          goFilterChunk arr (i + 1) limit mv
 {-# INLINE filterDirect #-}
 
 -- | O(n). Filter with index.
@@ -2665,6 +2701,10 @@ liftSmap f (MStream step s0) = MStream step' s0
   dropWhile p v = unstream (S.sdropWhile p (stream v))
 "pvector/zipWith [stream]" [~1] forall f v1 v2.
   zipWith f v1 v2 = unstream (S.szipWith f (stream v1) (stream v2))
+"pvector/init [stream]" [~1] forall v.
+  init v = unstream (S.sinit (stream v))
+"pvector/tail [stream]" [~1] forall v.
+  tail v = unstream (S.stail (stream v))
 "pvector/mapMaybe [stream]" [~1] forall f v.
   mapMaybe f v = unstream (S.smapMaybe f (stream v))
 -- === Consumer fusion: fuse folds when the input is already in stream form ===
@@ -2675,6 +2715,36 @@ liftSmap f (MStream step s0) = MStream step' s0
   foldlDirect f z (unstream s) = S.sfoldl' f z s
 "pvector/foldrDirect/unstream" forall f z s.
   foldrDirect f z (unstream s) = S.sfoldr f z s
+
+-- === Consumer forwarding: index/head/last directly from a stream ===
+-- Avoids materialising an entire vector just to read one element.
+-- E.g. head (map f v) becomes shead (smap f (stream v)) — O(1) work.
+"pvector/index/unstream" forall s i.
+  index (unstream s) i = S.sindex s i
+"pvector/(!?)/unstream" forall s i.
+  (unstream s) !? i = S.sindexM s i
+"pvector/head/unstream" forall s.
+  head (unstream s) = S.shead s
+"pvector/last/unstream" forall s.
+  last (unstream s) = S.slast s
+"pvector/unsafeIndex/unstream" forall s i.
+  unsafeIndex (unstream s) i = S.sindex s i
+
+-- === Slice through unstream: push slicing into the stream ===
+-- When a slice operation is applied to an already-streamed vector,
+-- fold the slice into the stream to avoid materialising then slicing.
+"pvector/take/unstream" forall n s.
+  take n (unstream s) = unstream (S.stake n s)
+"pvector/drop/unstream" forall n s.
+  drop n (unstream s) = unstream (S.sdrop n s)
+"pvector/init/unstream" forall s.
+  init (unstream s) = unstream (S.sinit s)
+"pvector/tail/unstream" forall s.
+  tail (unstream s) = unstream (S.stail s)
+
+-- === General uninplace: expose inplace form for further fusion ===
+"pvector/uninplace" forall (f :: forall m. Monad m => S.MStream m a -> S.MStream m a) g p.
+  stream (new (transform f g p)) = S.inplace f g (stream (new p))
 
 -- === Fallback rules: revert to direct implementations when not fused ===
 -- Phase [1] fires late so only standalone (unfused) operations match.
@@ -2692,10 +2762,194 @@ liftSmap f (MStream step s0) = MStream step' s0
   unstream (S.sdropWhile p (stream v)) = dropWhileDirect p v
 "pvector/zipWith [direct]" [1] forall f v1 v2.
   unstream (S.szipWith f (stream v1) (stream v2)) = zipWithDirect f v1 v2
+"pvector/init [direct]" [1] forall v.
+  unstream (S.sinit (stream v)) = initDirect v
+"pvector/tail [direct]" [1] forall v.
+  unstream (S.stail (stream v)) = tailDirect v
 "pvector/mapMaybe [direct]" [1] forall f v.
   unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
 
   #-}
+
+-- TODO: Vector-library rules not yet ported.
+--
+-- == Reverse streaming (requires streamR/unstreamR infrastructure) ==
+--   "streamR/unstreamR"              streamR (new (unstreamR s)) = s
+--   "unstreamR/streamR/new"          unstreamR (streamR (new p)) = p
+--   "unstream/streamR/new"           unstream (streamR (new p)) = modify reverse p
+--   "unstreamR/stream/new"           unstreamR (stream (new p)) = modify reverse p
+--   "inplace right"                  unstreamR (inplace f g (streamR (new m))) = transformR f g m
+--   "uninplace right"                streamR (new (transformR f g m)) = inplace f g (streamR (new m))
+--   "transformR/transformR [New]"    compose reverse transforms
+--   "transformR/unstreamR [New]"     fold reverse transform into bundle
+--
+-- == Monadic consumer forwarding ==
+--   "indexM/unstream"   "headM/unstream"   "lastM/unstream"
+--   "unsafeIndexM/unstream"   "unsafeHeadM/unstream"   "unsafeLastM/unstream"
+--
+-- == Self-zip optimisation ==
+--   "szipWith xs xs"    szipWith f s s = smap (\x -> f x x) s
+--
+-- == enumFromTo specialisations ==
+--   Type-specialised loops for Int, Word, Char, Double, etc.
+--
+-- == unstablePartition ==
+--   Fuse partition with stream to avoid materialising intermediate vector.
+--
+------------------------------------------------------------------------
+-- TODO: pvector-specific rules exploiting the chunked trie structure.
+-- These have no analogue in the flat-array vector library.
+------------------------------------------------------------------------
+--
+-- == Identity / cancellation rules ==
+--
+--   "map id"               map id v = v
+--   "reverse/reverse"      reverse (reverse v) = v
+--   "fromList/toList"      fromList (toList v) = v
+--   "concatMap singleton"  concatMap singleton v = v
+--
+--   These avoid O(n) reconstruction when the result is structurally
+--   identical.  map id commonly arises from specialisation / inlining.
+--
+-- == Structural cancellation (cons/snoc inverses) ==
+--
+--   "head/cons"     head (cons x v)  = x
+--   "last/snoc"     last (snoc v x)  = x
+--   "tail/cons"     tail (cons x v)  = v
+--   "init/snoc"     init (snoc v x)  = v
+--   "uncons/cons"   uncons (cons x v) = Just (x, v)
+--   "unsnoc/snoc"   unsnoc (snoc v x) = Just (v, x)
+--
+--   These are free wins when construction and deconstruction appear
+--   adjacent (common in recursive pipelines and fold/unfold duality).
+--
+-- == Cheap consumers on known-shape vectors ==
+--
+--   "length/map"       length (map f v)     = length v
+--   "length/reverse"   length (reverse v)   = length v
+--   "length/take"      length (take n v)    = min n (length v)
+--   "length/drop"      length (drop n v)    = max 0 (length v - n)
+--   "length/filter"    length (filter p v)  = count p v   (needs a count op)
+--   "length/replicate" length (replicate n x) = max 0 n
+--   "length/snoc"      length (snoc v x)    = length v + 1
+--   "length/cons"      length (cons x v)    = length v + 1
+--   "null/cons"        null (cons x v)      = False
+--   "null/snoc"        null (snoc v x)      = False
+--   "null/singleton"   null (singleton x)   = False
+--   "null/empty"       null empty           = True
+--   "null/map"         null (map f v)       = null v
+--
+--   length is O(1) via vSize — these rules avoid building an
+--   intermediate vector just to read its size field.
+--
+-- == Append identities ==
+--
+--   "empty ++ v"        empty ++ v = v
+--   "v ++ empty"        v ++ empty = v
+--   "singleton ++ v"    singleton x ++ v = cons x v
+--   "v ++ singleton"    v ++ singleton x = snoc v x
+--
+-- == Construction short-circuits ==
+--
+--   "map/replicate"     map f (replicate n x) = replicate n (f x)
+--   "map/singleton"     map f (singleton x)   = singleton (f x)
+--   "map/empty"         map f empty           = empty
+--   "filter/empty"      filter p empty        = empty
+--   "reverse/empty"     reverse empty         = empty
+--   "reverse/singleton" reverse (singleton x) = singleton x
+--   "foldl'/empty"      foldl' f z empty      = z
+--   "foldl'/singleton"  foldl' f z (singleton x) = f z x
+--
+--   These avoid entering the general O(n) path when the structure
+--   is trivially known.  map/replicate is particularly valuable:
+--   it replaces O(n) map + O(n) replicate with a single O(n)
+--   replicate.
+--
+-- == Cross-consumer forwarding ==
+--
+--   "index/map"         index (map f v) i = f (index v i)
+--   "head/map"          head (map f v) = f (head v)
+--   "last/map"          last (map f v) = f (last v)
+--   "all/map"           all p (map f v) = all (p . f) v
+--   "any/map"           any p (map f v) = any (p . f) v
+--   "elem/map"          elem x (map f v) = any (\a -> f a == x) v
+--
+--   These are partially handled by stream consumer forwarding
+--   (head/unstream etc.) but direct rules would fire even when
+--   stream forwarding doesn't apply.
+--
+-- == Take/drop algebra ==
+--
+--   "take/take"         take n (take m v) = take (min n m) v
+--   "drop/drop"         drop n (drop m v) = drop (n + m) v
+--   "take/drop"         take n (drop m v) = slice m n v
+--   "drop/take"         drop n (take m v) = take (max 0 (m-n)) (drop n v)
+--   "take/cons"         take n (cons x v) = cons x (take (n-1) v)  when n > 0
+--   "drop/snoc"         drop n (snoc v x) = snoc (drop n v) x     when n < length v
+--
+--   The stream-level rules (stake/stake, sdrop/sdrop) handle the
+--   fused case.  Direct vector-level rules would apply to standalone
+--   compositions and avoid stream round-trips.
+--
+-- == Tree-sharing take/drop ==
+--
+--   The current takeDirect/dropDirect use `generate`, which walks
+--   the old trie element-by-element and builds a completely new one.
+--   A trie-aware implementation could share entire subtrees that fall
+--   entirely within (or outside) the sliced range:
+--
+--     takeDirect n v   -- share all subtrees whose index range ⊆ [0,n)
+--     dropDirect n v   -- share all subtrees whose index range ⊆ [n,size)
+--
+--   For take 9000 on a 10000-element vector, this would share ~280
+--   of 312 leaf arrays and rebuild only the boundary path.  Cost
+--   drops from O(n) to O(log₃₂ n).
+--
+-- == Chunk-level stream fusion ==
+--
+--   See the detailed design note in Data.PVector.Internal.Stream.
+--   The idea: a second stream type that yields 32-element SmallArrays
+--   instead of individual elements, enabling fused pipelines to use
+--   tight inner loops (foldlChunk32, mapChunk32).
+--
+--   This would close the gap on fused pipelines like foldl' . map,
+--   where pvector's element-level stream fusion loses to Vector but
+--   pvector's standalone foldl' already wins via chunk walking.
+--
+-- == Direct chunk-fused consumers ==
+--
+--   Even without a full chunk stream, specific consumer+transformer
+--   pairs can be fused at the tree level:
+--
+--   "foldl'/map [chunk-fused]"
+--     foldl' f z (map g v) = foldChunks (\acc _ arr -> foldlArr (\b a -> f b (g a)) acc arr) z v
+--
+--   "foldl'/filter [chunk-fused]"
+--     foldl' f z (filter p v) = foldChunks (\acc _ arr -> foldlArr (\b a -> if p a then f b a else b) acc arr) z v
+--
+--   These bypass stream creation entirely. Each leaf chunk is
+--   processed in a tight 32-element loop.  The allPassChunk
+--   optimisation in filterDirect is a step in this direction.
+--
+-- == Chunk-aware zipWith ==
+--
+--   When zipping two PVectors of equal size, the trie structures
+--   are isomorphic.  A direct zipChunks could walk both tries in
+--   lockstep, pairing corresponding leaf SmallArrays:
+--
+--     zipWithDirect f v1 v2 = mapChunks (\off arr1 ->
+--       zipChunk32 f arr1 (leafAt off v2)) v1
+--
+--   This is more cache-friendly than the element-by-element stream
+--   zip because it accesses both arrays sequentially.
+--
+-- == Concat map / flatMap fusion ==
+--
+--   concatMap f v = concat (map f v)
+--
+--   If f consistently produces 32-element vectors, the output can
+--   be built with mPushChunk instead of element-by-element mPush.
+--   A specialised concatMapChunked could detect this at runtime.
 
 ------------------------------------------------------------------------
 -- Internal tree operations

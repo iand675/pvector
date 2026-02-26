@@ -58,6 +58,9 @@ module Data.PVector.Internal.Stream
   , sifilter
   , stake
   , sdrop
+  , sinit
+  , stail
+  , sslice
   , stakeWhile
   , sdropWhile
   , smapMaybe
@@ -72,6 +75,10 @@ module Data.PVector.Internal.Stream
   , slength
   , snull
   , stoList
+  , shead
+  , slast
+  , sindex
+  , sindexM
 
     -- * Monadic stream combinators (for inplace)
   , smapM
@@ -333,6 +340,43 @@ sdrop n (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, 0)) sz'
           Done       -> Id Done
 {-# INLINE [1] sdrop #-}
 
+sinit :: Bundle a -> Bundle a
+sinit (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, Nothing)) sz'
+  where
+    sz' = case sz of
+      Exact m -> Exact (max 0 (m - 1))
+      Max   m -> Max   (max 0 (m - 1))
+      Unknown -> Unknown
+    step' (s, buf) = case unId (step s) of
+      Yield a s' -> case buf of
+        Nothing -> Id (Skip (s', Just a))
+        Just b  -> Id (Yield b (s', Just a))
+      Skip    s' -> Id (Skip (s', buf))
+      Done       -> Id Done
+{-# INLINE [1] sinit #-}
+
+stail :: Bundle a -> Bundle a
+stail (Bundle (MStream step s0) sz) = Bundle (MStream step' (s0, False)) sz'
+  where
+    sz' = case sz of
+      Exact m -> Exact (max 0 (m - 1))
+      Max   m -> Max   (max 0 (m - 1))
+      Unknown -> Unknown
+    step' (s, dropped)
+      | dropped = case unId (step s) of
+          Yield a s' -> Id (Yield a (s', True))
+          Skip    s' -> Id (Skip (s', True))
+          Done       -> Id Done
+      | otherwise = case unId (step s) of
+          Yield _ s' -> Id (Skip (s', True))
+          Skip    s' -> Id (Skip (s', False))
+          Done       -> Id Done
+{-# INLINE [1] stail #-}
+
+sslice :: Int -> Int -> Bundle a -> Bundle a
+sslice i n s = stake n (sdrop i s)
+{-# INLINE sslice #-}
+
 sconcat :: Bundle a -> Bundle a -> Bundle a
 sconcat (Bundle (MStream stepL sL0) szL) (Bundle (MStream stepR sR0) szR) =
   Bundle (MStream step (Left sL0)) sz
@@ -455,6 +499,48 @@ snull (Bundle (MStream step s0) _) = go s0
 stoList :: Bundle a -> [a]
 stoList = sfoldr (:) []
 {-# INLINE stoList #-}
+
+shead :: Bundle a -> a
+shead (Bundle (MStream step s0) _) = go s0
+  where
+    go s = case unId (step s) of
+      Yield a _ -> a
+      Skip   s' -> go s'
+      Done      -> error "pvector: shead of empty stream"
+{-# INLINE [1] shead #-}
+
+slast :: Bundle a -> a
+slast (Bundle (MStream step s0) _) = start s0
+  where
+    start s = case unId (step s) of
+      Yield a s' -> go a s'
+      Skip    s' -> start s'
+      Done       -> error "pvector: slast of empty stream"
+    go !prev s = case unId (step s) of
+      Yield a s' -> go a s'
+      Skip    s' -> go prev s'
+      Done       -> prev
+{-# INLINE [1] slast #-}
+
+sindex :: Bundle a -> Int -> a
+sindex (Bundle (MStream step s0) _) i = go i s0
+  where
+    go !j s = case unId (step s) of
+      Yield a s' | j == 0    -> a
+                 | otherwise -> go (j - 1) s'
+      Skip    s'             -> go j s'
+      Done                   -> error "pvector: sindex out of bounds"
+{-# INLINE [1] sindex #-}
+
+sindexM :: Bundle a -> Int -> Maybe a
+sindexM (Bundle (MStream step s0) _) i = go i s0
+  where
+    go !j s = case unId (step s) of
+      Yield a s' | j == 0    -> Just a
+                 | otherwise -> go (j - 1) s'
+      Skip    s'             -> go j s'
+      Done                   -> Nothing
+{-# INLINE [1] sindexM #-}
 
 ------------------------------------------------------------------------
 -- Monadic stream combinators (polymorphic in m, needed for inplace)
@@ -628,6 +714,14 @@ sscanl1M' f (MStream step s0) = MStream step' (s0, Nothing)
 -- === Filter through take/drop ===
 "stake/sfilter"   forall n p s.  stake n (sfilter p s)   = sfilter p (stake n s)
 
+-- === Take/drop composition ===
+"stake/stake"     forall n m s.  stake n (stake m s)     = stake (min n m) s
+"sdrop/sdrop"     forall n m s.  sdrop n (sdrop m s)     = sdrop (n + m) s
+
+-- === Init/tail through map ===
+"smap/sinit"      forall f s.    sinit (smap f s)        = smap f (sinit s)
+"smap/stail"      forall f s.    stail (smap f s)        = smap f (stail s)
+
 -- === takeWhile/dropWhile through map ===
 "smap/stakeWhile" forall f p s.  stakeWhile p (smap f s) = smap f (stakeWhile (p . f) s)
 "smap/sdropWhile" forall f p s.  sdropWhile p (smap f s) = smap f (sdropWhile (p . f) s)
@@ -639,3 +733,43 @@ sscanl1M' f (MStream step s0) = MStream step' (s0, Nothing)
          g1 g2 s.
   inplace f1 g1 (inplace f2 g2 s) = inplace (f1 . f2) (g1 . g2) s
   #-}
+
+-- TODO: Additional stream-level rules that may be worth adding.
+--
+-- == From vector (not yet ported) ==
+--   "sdrop/sfilter"     sdrop n (sfilter p s) = sfilter p (sdrop n s)
+--   "sconcat/smap"      sconcat (smap f s1) (smap f s2) = smap f (sconcat s1 s2)
+--   enumFromStepN type specialisations for Int, Word, etc.
+--
+-- == Chunk-level stream fusion (pvector-specific) ==
+--
+-- pvector's 32-element leaf SmallArrays are a structural advantage
+-- over flat-array vectors.  A "chunk stream" that yields entire
+-- SmallArrays instead of single elements would let fused pipelines
+-- process data 32 elements at a time with tight unrolled inner loops
+-- (foldlChunk32, mapChunk32).
+--
+--   data CStep s a = CYield !(SmallArray a) !Int s | CDone
+--   data CStream a = forall s. CStream (s -> CStep s a) s
+--
+--   cstream  :: Vector a -> CStream a      -- yield each leaf/tail
+--   cfoldl'  :: (b -> a -> b) -> b -> CStream a -> b
+--                                           -- inner loop: foldlChunk32
+--   cmap     :: (a -> b) -> CStream a -> CStream b
+--                                           -- inner loop: mapChunk32
+--
+-- Rules:
+--   "cfoldl'/cstream"   foldl' f z v = cfoldl' f z (cstream v)
+--   "cfoldl'/cmap"      cfoldl' f z (cmap g s) = cfoldl' (\b a -> f b (g a)) z s
+--   "cmap/cmap"          cmap f (cmap g s) = cmap (f . g) s
+--
+-- The chunk stream would degrade gracefully: operations that can't
+-- maintain chunk boundaries (filter, zip of different sizes) fall
+-- back to element-level processing within a chunk.  This gives the
+-- best of both worlds: chunk-level throughput for map/fold, with
+-- element-level flexibility for filter/zip.
+--
+-- The existing foldl' direct implementation already exploits chunks
+-- via foldlChunk32 (which is why pvector's standalone foldl' is
+-- faster than Data.Vector).  The chunk stream would extend this
+-- benefit to *fused pipelines* like foldl' . map . filter.

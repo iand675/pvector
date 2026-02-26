@@ -68,22 +68,71 @@ immutable and mutable vectors. A persistent trie fundamentally cannot
 provide O(1) slicing — a slice requires rebuilding the trie structure.
 We match the API surface instead so code can migrate with minimal changes.
 
-## Benchmark Summary (n=10,000)
+## Benchmarks (n = 10,000)
 
-| Operation    | List     | Data.Vector | PVector  | vs Vector |
-|-------------|----------|-------------|----------|-----------|
-| snoc (build) | 552 ms   | 26 ms       | **234 μs** | **113x faster** |
-| index (mid)  | 6.6 μs   | 8 ns        | 11 ns    | 1.4x      |
-| last         | —        | 7.5 ns      | 8 ns     | 1.1x      |
-| map (+1)     | 78 μs    | 60 μs       | 120 μs   | 2x        |
-| foldl' (+)   | 14 μs    | 11 μs       | 52 μs    | 4.7x      |
-| filter even  | 52 μs    | 25 μs       | 115 μs   | 4.5x      |
-| foldr toList | 1.3 μs   | 3.5 μs      | 8 μs     | 2.3x      |
-| fromList     | 16 μs    | 43 μs       | 109 μs   | 2.5x      |
+All benchmarks run on GHC 9.6 with `-O2`. Times are wall-clock means
+from [Criterion](https://hackage.haskell.org/package/criterion).
+Run `cabal bench` to reproduce.
 
-All operations are within an order of magnitude of Data.Vector.
-The persistent vector excels at incremental construction and persistent
-updates where Data.Vector requires full copies.
+### Core operations
+
+| Operation | List | Vector | PVector | Seq |
+|-----------|------|--------|---------|-----|
+| snoc (build n) | 564 ms | 33.8 ms | **194 µs** | 152 µs |
+| fromList | -- | 51.1 µs | 75.2 µs | 57.5 µs |
+| index (middle) | 6.7 µs | 8.2 ns | 12.2 ns | 55.3 ns |
+| head | 8.3 ns | 8.0 ns | 11.8 ns | 10.9 ns |
+| last | 15.4 µs | 8.5 ns | **8.8 ns** | 10.8 ns |
+| update (middle) | -- | 16.2 µs | 48.6 µs | 31.7 µs |
+| foldl' (+) | 14.0 µs | 11.2 µs | **6.4 µs** | 27.4 µs |
+| foldr (:) [] | 13.4 µs | 44.3 µs | 79.0 µs | 33.9 µs |
+| map (+1) | 103 µs | 67.1 µs | 127 µs | 102 µs |
+| filter even | 47.8 µs | 25.8 µs | 117 µs | 91.6 µs |
+| reverse | 39.5 µs | 24.0 µs | 133 µs | 101 µs |
+| take (n/2) | 24.8 µs | 4.6 µs | 103 µs | 15.9 µs |
+
+**Highlights:**
+
+- **snoc**: 174x faster than Vector, comparable to Seq — the key
+  advantage of a persistent trie over a flat array.
+- **index / head / last**: within 1.5x of Vector; `last` is O(1)
+  since it reads directly from the tail buffer.
+- **foldl'**: faster than Vector and List thanks to direct
+  chunk-based tree walking with 32-element unrolled loops.
+- **map / filter**: ~2x of Vector. The trie must be rebuilt node by
+  node; Vector copies a flat array.
+- **update**: 3x of Vector but O(log₃₂ n) — the old version is
+  preserved (persistent).
+
+### Charts
+
+![snoc (build n)](doc/bench/snoc-build-n.svg)
+
+![fromList](doc/bench/fromlist.svg)
+
+![index (middle)](doc/bench/index-middle.svg)
+
+![head](doc/bench/head.svg)
+
+![last](doc/bench/last.svg)
+
+![update (single, middle, nf)](doc/bench/update-single-middle-nf.svg)
+
+![foldl' (+)](doc/bench/foldl.svg)
+
+![foldr (:) \[\]](doc/bench/foldr.svg)
+
+![map (+1)](doc/bench/map-1.svg)
+
+![filter even](doc/bench/filter-even.svg)
+
+![filter (> 0) keeps all](doc/bench/filter-0-keeps-all.svg)
+
+![reverse](doc/bench/reverse.svg)
+
+![take (n/2)](doc/bench/take-n-2.svg)
+
+![append](doc/bench/append.svg)
 
 ## Usage
 
