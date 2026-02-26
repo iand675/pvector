@@ -13,6 +13,18 @@ module Data.PVector.Internal
     -- * Persistent node
   , Node(..)
 
+    -- * RRB node operations
+  , nodeSize
+  , nodeSizes
+  , mkBalanced
+  , mkRelaxed
+  , isBalancedAtShift
+  , radixIndex
+  , relaxedIndex
+  , treeIndex
+  , treeLeafFor
+  , computeSizeTable
+
     -- * Mutable node
   , MNode(..)
   , freezeNode
@@ -25,9 +37,9 @@ module Data.PVector.Internal
   , mapMutableArr
 
     -- * Unrolled chunk operations
-  , foldlChunk32
-  , foldrChunk32
-  , mapChunk32
+  , foldlChunk
+  , foldrChunk
+  , mapChunk
 
     -- * Fused clone-and-set
   , cloneAndSet32
@@ -42,9 +54,19 @@ module Data.PVector.Internal
   , snocArray
   , consArray
   , unsnocArray
+  , unconsArray
   , cloneAndSet
   , rnfArray
   , mapArray'
+
+    -- * PrimArray re-exports and helpers
+  , PrimArray
+  , sizeofPrimArray
+  , indexPrimArray
+  , primArrayFromList
+  , newPrimArray
+  , writePrimArray
+  , unsafeFreezePrimArray
   ) where
 
 import Control.DeepSeq (NFData(..))
@@ -52,7 +74,10 @@ import Control.Monad.Primitive
 import Control.Monad.ST
 import Data.Bits
 import Data.Primitive.SmallArray
+import qualified Data.Primitive.PrimArray as PA
 import Unsafe.Coerce (unsafeCoerce)
+
+type PrimArray = PA.PrimArray
 
 bfBits :: Int
 bfBits = 5
@@ -82,17 +107,145 @@ indexAtLevel i level = unsafeShiftR i level .&. bfMask
 
 data Node a
   = Internal {-# UNPACK #-} !(SmallArray (Node a))
+  | Relaxed  {-# UNPACK #-} !(SmallArray (Node a)) {-# UNPACK #-} !(PA.PrimArray Int)
   | Leaf     {-# UNPACK #-} !(SmallArray a)
   | Empty
 
 instance NFData a => NFData (Node a) where
   rnf Empty = ()
   rnf (Leaf arr) = rnfArray arr
-  rnf (Internal arr) = go 0
-    where
-      go i
-        | i >= bf   = ()
-        | otherwise = rnf (indexSmallArray arr i) `seq` go (i + 1)
+  rnf (Internal arr) = rnfNodeArr arr
+  rnf (Relaxed arr _) = rnfNodeArr arr
+
+rnfNodeArr :: NFData a => SmallArray (Node a) -> ()
+rnfNodeArr arr = go 0
+  where
+    !n = sizeofSmallArray arr
+    go i
+      | i >= n    = ()
+      | otherwise = rnf (indexSmallArray arr i) `seq` go (i + 1)
+
+------------------------------------------------------------------------
+-- RRB node operations
+------------------------------------------------------------------------
+
+-- | Compute the total number of elements under a node at the given shift level.
+-- For Leaf: the array size.
+-- For Internal (balanced): (nChildren - 1) * fullChildSize + lastChildSize.
+-- For Relaxed: the last entry in the cumulative size table.
+nodeSize :: Int -> Node a -> Int
+nodeSize _ Empty = 0
+nodeSize _ (Leaf arr) = sizeofSmallArray arr
+nodeSize _ (Relaxed _ sizes) = PA.indexPrimArray sizes (PA.sizeofPrimArray sizes - 1)
+nodeSize shift (Internal arr) =
+  let !nch = sizeofSmallArray arr
+  in case nch of
+    0 -> 0
+    1 -> nodeSize (shift - bfBits) (indexSmallArray arr 0)
+    _ -> let !fullChildSz = unsafeShiftL 1 shift
+             !lastSz = nodeSize (shift - bfBits) (indexSmallArray arr (nch - 1))
+         in (nch - 1) * fullChildSz + lastSz
+{-# INLINEABLE nodeSize #-}
+
+-- | Build the cumulative size table for a SmallArray of children at the given shift.
+-- Used when creating Relaxed nodes during concat/split.
+computeSizeTable :: Int -> SmallArray (Node a) -> PA.PrimArray Int
+computeSizeTable shift children = runST $ do
+  let !n = sizeofSmallArray children
+  marr <- PA.newPrimArray n
+  let go !i !cumul
+        | i >= n = pure ()
+        | otherwise = do
+            let !sz = nodeSize (shift - bfBits) (indexSmallArray children i)
+                !cumul' = cumul + sz
+            PA.writePrimArray marr i cumul'
+            go (i + 1) cumul'
+  go 0 0
+  PA.unsafeFreezePrimArray marr
+{-# INLINEABLE computeSizeTable #-}
+
+-- | Build the cumulative size table for children, given a list of sizes.
+nodeSizes :: [Int] -> PA.PrimArray Int
+nodeSizes szs = primArrayFromList (scanl1' (+) szs)
+  where
+    scanl1' _ [] = []
+    scanl1' f (x:xs) = go x xs
+      where
+        go !acc [] = [acc]
+        go !acc (y:ys) = acc : go (f acc y) ys
+
+-- | Create a balanced internal node from an array of children.
+-- Only valid when all children (except possibly the last) are full at the given shift.
+mkBalanced :: SmallArray (Node a) -> Node a
+mkBalanced children
+  | sizeofSmallArray children == 0 = Empty
+  | otherwise = Internal children
+{-# INLINE mkBalanced #-}
+
+-- | Create a relaxed node with explicit size table.
+mkRelaxed :: SmallArray (Node a) -> PA.PrimArray Int -> Node a
+mkRelaxed children sizes
+  | sizeofSmallArray children == 0 = Empty
+  | otherwise = Relaxed children sizes
+{-# INLINE mkRelaxed #-}
+
+-- | Check if a node at the given shift is strictly radix-balanced
+-- (all children except possibly the last have exactly 2^shift elements).
+isBalancedAtShift :: Int -> SmallArray (Node a) -> Bool
+isBalancedAtShift shift children =
+  let !nch = sizeofSmallArray children
+      !fullSz = unsafeShiftL 1 shift
+      go !i
+        | i >= nch - 1 = True
+        | nodeSize (shift - bfBits) (indexSmallArray children i) == fullSz = go (i + 1)
+        | otherwise = False
+  in nch <= 1 || go 0
+
+-- | Index into a tree. Handles both balanced (radix) and relaxed (size-table) nodes.
+-- @shift@ is the shift level of the root, @i@ is the local index within the tree.
+treeIndex :: Int -> Int -> Node a -> a
+treeIndex !shift !i node = case node of
+  Leaf arr -> indexSmallArray arr (i .&. bfMask)
+  Internal arr ->
+    let !idx = indexAtLevel i shift
+    in treeIndex (shift - bfBits) i (indexSmallArray arr idx)
+  Relaxed arr sizes ->
+    let !idx = relaxedIndex sizes i
+        !off = if idx == 0 then 0 else indexPrimArray sizes (idx - 1)
+    in treeIndex (shift - bfBits) (i - off) (indexSmallArray arr idx)
+  Empty -> error "pvector: treeIndex hit Empty"
+{-# INLINEABLE treeIndex #-}
+
+-- | Navigate to the leaf array containing element at local index @i@.
+treeLeafFor :: Int -> Int -> Node a -> SmallArray a
+treeLeafFor !shift !i node = case node of
+  Leaf arr -> arr
+  Internal arr ->
+    let !idx = indexAtLevel i shift
+    in treeLeafFor (shift - bfBits) i (indexSmallArray arr idx)
+  Relaxed arr sizes ->
+    let !idx = relaxedIndex sizes i
+        !off = if idx == 0 then 0 else indexPrimArray sizes (idx - 1)
+    in treeLeafFor (shift - bfBits) (i - off) (indexSmallArray arr idx)
+  Empty -> error "pvector: treeLeafFor hit Empty"
+{-# INLINEABLE treeLeafFor #-}
+
+-- | Pure radix index: extract the slot index from an element index at the given level.
+radixIndex :: Int -> Int -> Int
+radixIndex i level = unsafeShiftR i level .&. bfMask
+{-# INLINE radixIndex #-}
+
+-- | Find the child index in a relaxed node's cumulative size table.
+-- Uses linear scan (m <= 32, fits in a cache line).
+relaxedIndex :: PA.PrimArray Int -> Int -> Int
+relaxedIndex sizes !i = go 0
+  where
+    !n = PA.sizeofPrimArray sizes
+    go !k
+      | k >= n = error "pvector: relaxedIndex out of bounds"
+      | PA.indexPrimArray sizes k > i = k
+      | otherwise = go (k + 1)
+{-# INLINE relaxedIndex #-}
 
 ------------------------------------------------------------------------
 -- Mutable (transient) node
@@ -111,9 +264,10 @@ freezeNode :: PrimMonad m => MNode (PrimState m) a -> m (Node a)
 freezeNode (Frozen node) = pure node
 freezeNode (MLeaf marr)  = Leaf <$> unsafeFreezeSmallArray marr
 freezeNode (MInternal marr) = do
-  buf <- newSmallArray bf Empty
+  let !n = sizeofSmallMutableArray marr
+  buf <- newSmallArray n Empty
   let go i
-        | i >= bf   = pure ()
+        | i >= n    = pure ()
         | otherwise = do
             child <- readSmallArray marr i
             p <- freezeNode child
@@ -129,15 +283,26 @@ editableInternal
   -> m (SmallMutableArray (PrimState m) (MNode (PrimState m) a))
 editableInternal (MInternal arr) = pure arr
 editableInternal (Frozen (Internal arr)) = do
-  marr <- newSmallArray bf (Frozen Empty)
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n (Frozen Empty)
   let go i
-        | i >= bf   = pure ()
+        | i >= n    = pure ()
         | otherwise = do
             writeSmallArray marr i (Frozen (indexSmallArray arr i))
             go (i + 1)
   go 0
   pure marr
-editableInternal (Frozen Empty) = newSmallArray bf (Frozen Empty)
+editableInternal (Frozen (Relaxed arr _)) = do
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n (Frozen Empty)
+  let go i
+        | i >= n    = pure ()
+        | otherwise = do
+            writeSmallArray marr i (Frozen (indexSmallArray arr i))
+            go (i + 1)
+  go 0
+  pure marr
+editableInternal (Frozen Empty) = newSmallArray 0 (Frozen Empty)
 editableInternal _ = error "pvector: editableInternal on leaf node"
 {-# INLINEABLE editableInternal #-}
 
@@ -146,7 +311,7 @@ editableLeaf
   => MNode (PrimState m) a
   -> m (SmallMutableArray (PrimState m) a)
 editableLeaf (MLeaf arr) = pure arr
-editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 bf
+editableLeaf (Frozen (Leaf arr)) = thawSmallArray arr 0 (sizeofSmallArray arr)
 editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 {-# INLINEABLE editableLeaf #-}
 
@@ -157,15 +322,18 @@ editableLeaf _ = error "pvector: editableLeaf on non-leaf node"
 mMapNodeInPlace :: PrimMonad m => (a -> a) -> Int -> MNode (PrimState m) a -> m (MNode (PrimState m) a)
 mMapNodeInPlace _ _ n@(Frozen Empty) = pure n
 mMapNodeInPlace f _ (MLeaf arr) = do
-  mapMutableArr f arr 0 bf
+  let !n = sizeofSmallMutableArray arr
+  mapMutableArr f arr 0 n
   pure (MLeaf arr)
 mMapNodeInPlace f _ (Frozen (Leaf arr)) = do
-  marr <- thawSmallArray arr 0 bf
-  mapMutableArr f marr 0 bf
+  let !n = sizeofSmallArray arr
+  marr <- thawSmallArray arr 0 n
+  mapMutableArr f marr 0 n
   pure (MLeaf marr)
 mMapNodeInPlace f shift (MInternal arr) = do
-  let go i
-        | i >= bf   = pure ()
+  let !n = sizeofSmallMutableArray arr
+      go i
+        | i >= n    = pure ()
         | otherwise = do
             child <- readSmallArray arr i
             child' <- mMapNodeInPlace f (shift - bfBits) child
@@ -174,9 +342,21 @@ mMapNodeInPlace f shift (MInternal arr) = do
   go 0
   pure (MInternal arr)
 mMapNodeInPlace f shift (Frozen (Internal arr)) = do
-  marr <- newSmallArray bf (Frozen Empty)
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n (Frozen Empty)
   let go i
-        | i >= bf   = pure ()
+        | i >= n    = pure ()
+        | otherwise = do
+            child' <- mMapNodeInPlace f (shift - bfBits) (Frozen (indexSmallArray arr i))
+            writeSmallArray marr i child'
+            go (i + 1)
+  go 0
+  pure (MInternal marr)
+mMapNodeInPlace f shift (Frozen (Relaxed arr _)) = do
+  let !n = sizeofSmallArray arr
+  marr <- newSmallArray n (Frozen Empty)
+  let go i
+        | i >= n    = pure ()
         | otherwise = do
             child' <- mMapNodeInPlace f (shift - bfBits) (Frozen (indexSmallArray arr i))
             writeSmallArray marr i child'
@@ -200,9 +380,14 @@ mapMutableArr f arr = go
 -- Unrolled chunk operations
 ------------------------------------------------------------------------
 
--- | Strict left fold over a full 32-element SmallArray.
--- Uses manual 4x unrolling so GHC generates a tight loop
--- without per-element bounds checks.
+-- | Strict left fold over a SmallArray. Uses 4x unrolling for full 32-element arrays.
+foldlChunk :: (b -> a -> b) -> b -> SmallArray a -> b
+foldlChunk f !z0 arr
+  | n == bf   = foldlChunk32 f z0 arr
+  | otherwise = foldlChunkN f z0 arr n
+  where !n = sizeofSmallArray arr
+{-# INLINE foldlChunk #-}
+
 foldlChunk32 :: (b -> a -> b) -> b -> SmallArray a -> b
 foldlChunk32 f !z0 arr = go z0 0
   where
@@ -218,7 +403,22 @@ foldlChunk32 f !z0 arr = go z0 0
           go (f z (indexSmallArray arr i)) (i + 1)
 {-# INLINE foldlChunk32 #-}
 
--- | Right fold over a full 32-element SmallArray.
+foldlChunkN :: (b -> a -> b) -> b -> SmallArray a -> Int -> b
+foldlChunkN f !z0 arr !n = go z0 0
+  where
+    go !z !i
+      | i >= n    = z
+      | otherwise = go (f z (indexSmallArray arr i)) (i + 1)
+{-# INLINE foldlChunkN #-}
+
+-- | Right fold over a SmallArray.
+foldrChunk :: (a -> b -> b) -> SmallArray a -> b -> b
+foldrChunk f arr z0
+  | n == bf   = foldrChunk32 f arr z0
+  | otherwise = foldrChunkN f arr n z0
+  where !n = sizeofSmallArray arr
+{-# INLINE foldrChunk #-}
+
 foldrChunk32 :: (a -> b -> b) -> SmallArray a -> b -> b
 foldrChunk32 f arr z0 = go 0
   where
@@ -227,7 +427,22 @@ foldrChunk32 f arr z0 = go 0
       | otherwise = f (indexSmallArray arr i) (go (i + 1))
 {-# INLINE foldrChunk32 #-}
 
--- | Strict map over a full 32-element SmallArray.
+foldrChunkN :: (a -> b -> b) -> SmallArray a -> Int -> b -> b
+foldrChunkN f arr !n z0 = go 0
+  where
+    go !i
+      | i >= n    = z0
+      | otherwise = f (indexSmallArray arr i) (go (i + 1))
+{-# INLINE foldrChunkN #-}
+
+-- | Strict map over a SmallArray.
+mapChunk :: (a -> b) -> SmallArray a -> SmallArray b
+mapChunk f arr
+  | n == bf   = mapChunk32 f arr
+  | otherwise = mapArray' f arr
+  where !n = sizeofSmallArray arr
+{-# INLINE mapChunk #-}
+
 mapChunk32 :: (a -> b) -> SmallArray a -> SmallArray b
 mapChunk32 f arr = runST $ do
   marr <- newSmallArray 32 undefinedElem
@@ -250,16 +465,13 @@ mapChunk32 f arr = runST $ do
 -- Unsafe node accessors
 ------------------------------------------------------------------------
 
--- | Extract the child array from a Node that is known to be Internal.
--- Uses a single-alternative case to hint to GHC that only Internal
--- is possible, which can eliminate the tag check in optimized code.
 unsafeNodeChildren :: Node a -> SmallArray (Node a)
 unsafeNodeChildren n = case n of
   Internal arr -> arr
-  _ -> undefinedElem  -- unreachable; marked as bottom so GHC eliminates it
+  Relaxed arr _ -> arr
+  _ -> undefinedElem
 {-# INLINE unsafeNodeChildren #-}
 
--- | Extract the element array from a Node that is known to be a Leaf.
 unsafeLeafArray :: Node a -> SmallArray a
 unsafeLeafArray n = case n of
   Leaf arr -> arr
@@ -270,9 +482,6 @@ unsafeLeafArray n = case n of
 -- Fused clone-and-set
 ------------------------------------------------------------------------
 
--- | Clone a known-32-element SmallArray and set one slot.
--- Uses thawSmallArray with the constant size bf, then write+freeze.
--- The INLINE ensures this fuses into a single allocation at call sites.
 cloneAndSet32 :: SmallArray a -> Int -> a -> SmallArray a
 cloneAndSet32 arr i x = runST $ do
   marr <- thawSmallArray arr 0 bf
@@ -285,9 +494,7 @@ cloneAndSet32 arr i x = runST $ do
 ------------------------------------------------------------------------
 
 emptyRoot :: Node a
-emptyRoot = Internal $ runST $ do
-  arr <- newSmallArray bf Empty
-  unsafeFreezeSmallArray arr
+emptyRoot = Empty
 {-# NOINLINE emptyRoot #-}
 
 emptyTail :: SmallArray a
@@ -317,6 +524,14 @@ unsnocArray arr =
       !a' = cloneSmallArray arr 0 (n - 1)
   in (a', x)
 {-# INLINE unsnocArray #-}
+
+unconsArray :: SmallArray a -> (a, SmallArray a)
+unconsArray arr =
+  let !x  = indexSmallArray arr 0
+      !n  = sizeofSmallArray arr
+      !a' = cloneSmallArray arr 1 (n - 1)
+  in (x, a')
+{-# INLINE unconsArray #-}
 
 cloneAndSet :: SmallArray a -> Int -> a -> SmallArray a
 cloneAndSet arr i x = runST $ do
@@ -350,3 +565,36 @@ rnfArray arr = go 0
 undefinedElem :: a
 undefinedElem = error "pvector: undefined element"
 {-# NOINLINE undefinedElem #-}
+
+------------------------------------------------------------------------
+-- PrimArray helpers
+------------------------------------------------------------------------
+
+sizeofPrimArray :: PA.PrimArray Int -> Int
+sizeofPrimArray = PA.sizeofPrimArray
+{-# INLINE sizeofPrimArray #-}
+
+indexPrimArray :: PA.PrimArray Int -> Int -> Int
+indexPrimArray = PA.indexPrimArray
+{-# INLINE indexPrimArray #-}
+
+newPrimArray :: PrimMonad m => Int -> m (PA.MutablePrimArray (PrimState m) Int)
+newPrimArray = PA.newPrimArray
+{-# INLINE newPrimArray #-}
+
+writePrimArray :: PrimMonad m => PA.MutablePrimArray (PrimState m) Int -> Int -> Int -> m ()
+writePrimArray = PA.writePrimArray
+{-# INLINE writePrimArray #-}
+
+unsafeFreezePrimArray :: PrimMonad m => PA.MutablePrimArray (PrimState m) Int -> m (PA.PrimArray Int)
+unsafeFreezePrimArray = PA.unsafeFreezePrimArray
+{-# INLINE unsafeFreezePrimArray #-}
+
+primArrayFromList :: [Int] -> PA.PrimArray Int
+primArrayFromList xs = runST $ do
+  let !n = Prelude.length xs
+  marr <- PA.newPrimArray n
+  let go !_ [] = pure ()
+      go !i (v:vs) = PA.writePrimArray marr i v >> go (i + 1) vs
+  go 0 xs
+  PA.unsafeFreezePrimArray marr
