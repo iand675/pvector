@@ -1207,32 +1207,21 @@ foldl f z0 v = foldrDirect (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' f !z v = foldlDirect f z v
-{-# NOINLINE [1] foldl' #-}
+foldl' = foldlDirect
+{-# INLINE foldl' #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
-foldlDirect f = foldlWithGoArr (\z arr i limit -> goArrF z arr i limit) 
-  where
-    goArrF !z !arr !i !limit
-      | i >= limit = z
-      | otherwise  = goArrF (f z (indexSmallArray arr i)) arr (i + 1) limit
-{-# INLINE [1] foldlDirect #-}
-
--- | Core fold engine: walks prefix → tree → tail, applying @arrFold@
--- to each contiguous SmallArray segment. The @arrFold@ is the tight
--- inner loop that GHC specializes per call site.
-foldlWithGoArr :: (b -> SmallArray a -> Int -> Int -> b) -> b -> Vector a -> b
-foldlWithGoArr arrFold = \ !z0 v ->
+foldlDirect f = \ !z0 v ->
   if vSize v == 0
   then z0
   else
-    let !z1 = arrFold z0 (vPrefix v) 0 (sizeofSmallArray (vPrefix v))
+    let !z1 = goArr z0 (vPrefix v) 0 (sizeofSmallArray (vPrefix v))
         !z2 = goNode z1 (vShift v) (vRoot v)
-        !z3 = arrFold z2 (vTail v) 0 (sizeofSmallArray (vTail v))
+        !z3 = goArr z2 (vTail v) 0 (sizeofSmallArray (vTail v))
     in z3
   where
     goNode !z !_ Empty = z
-    goNode !z !_ (Leaf arr) = arrFold z arr 0 (sizeofSmallArray arr)
+    goNode !z !_ (Leaf arr) = foldlChunk f z arr
     goNode !z !shift (Internal arr) = goChildren z shift arr
     goNode !z !shift (Relaxed arr _) = goChildren z shift arr
 
@@ -1242,31 +1231,11 @@ foldlWithGoArr arrFold = \ !z0 v ->
             | i >= nc   = z'
             | otherwise = go (goNode z' (shift - bfBits) (indexSmallArray arr i)) (i + 1)
       in go z 0
-{-# INLINE foldlWithGoArr #-}
 
--- | Fused fold+map: walks the tree chunk-by-chunk, applying @g@ then @f@
--- in a single tight loop per leaf. O(n), not O(n log n).
-foldlMapDirect :: (b -> c -> b) -> (a -> c) -> b -> Vector a -> b
-foldlMapDirect f g = foldlWithGoArr goArrMapped
-  where
-    goArrMapped !z !arr !i !limit
+    goArr !z !arr !i !limit
       | i >= limit = z
-      | otherwise  = goArrMapped (f z (g (indexSmallArray arr i))) arr (i + 1) limit
-{-# INLINE foldlMapDirect #-}
-
--- | Fused fold+filter: walks the tree chunk-by-chunk, testing @p@ then
--- applying @f@ in a single tight loop per leaf. O(n), not O(n log n).
-foldlFilterDirect :: (b -> a -> b) -> (a -> Bool) -> b -> Vector a -> b
-foldlFilterDirect f p = foldlWithGoArr goArrFiltered
-  where
-    goArrFiltered !z !arr !i !limit
-      | i >= limit = z
-      | otherwise  =
-          let !x = indexSmallArray arr i
-          in if p x
-             then goArrFiltered (f z x) arr (i + 1) limit
-             else goArrFiltered z arr (i + 1) limit
-{-# INLINE foldlFilterDirect #-}
+      | otherwise  = goArr (f z (indexSmallArray arr i)) arr (i + 1) limit
+{-# INLINE [1] foldlDirect #-}
 
 foldl1 :: (a -> a -> a) -> Vector a -> a
 foldl1 f v
@@ -2569,21 +2538,6 @@ liftSmap f (MStream step s0) = MStream step' s0
 ------------------------------------------------------------------------
 
 {-# RULES
-
--- === Pre-stream chunk-fused fold rules ===
--- These fire at [~2] BEFORE the stream-forwarding rules at [~1].
--- They intercept foldl'.map and foldl'.filter and route them to
--- chunk-walking implementations that are O(n) instead of the
--- O(n log n) element-level stream path (which calls treeIndex per element).
-
-"pvector/foldl'/map [chunk-fused]" [~2] forall f g z v.
-  foldl' f z (map g v) = foldlMapDirect f g z v
-
-"pvector/foldl'/filter [chunk-fused]" [~2] forall f z p v.
-  foldl' f z (filter p v) = foldlFilterDirect f p z v
-
-"pvector/foldl'/map/filter [chunk-fused]" [~2] forall f g z p v.
-  foldl' f z (map g (filter p v)) = foldlMapDirect f g z (filterDirect p v)
 
 -- === Core fusion and recycling rules ===
 
