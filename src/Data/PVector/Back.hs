@@ -1564,8 +1564,8 @@ flushTailIntoTree shift root tailArr
   | sizeofSmallArray tailArr == 0 = (shift, root)
   | isEmpty root = (bfBits, Leaf tailArr)
   | otherwise =
-      let !treeN = nodeSize shift root + sizeofSmallArray tailArr
-          !willOverflow = treeN > 0 && treeN > unsafeShiftL 1 (shift + bfBits)
+      let !newTreeN = nodeSize shift root + sizeofSmallArray tailArr
+          !willOverflow = unsafeShiftR newTreeN bfBits > unsafeShiftL 1 shift
       in if willOverflow
          then let !newArr = runST $ do
                     a <- newSmallArray 2 Empty
@@ -1573,7 +1573,7 @@ flushTailIntoTree shift root tailArr
                     writeSmallArray a 1 (newPath shift (Leaf tailArr))
                     unsafeFreezeSmallArray a
               in (shift + bfBits, Internal newArr)
-         else (shift, pushTail (nodeSize shift root) shift root tailArr)
+         else (shift, pushTail newTreeN shift root tailArr)
   where
     isEmpty Empty = True
     isEmpty _ = False
@@ -2116,7 +2116,14 @@ mPushTail
   :: PrimMonad m
   => Int -> Int -> MNode (PrimState m) a -> SmallArray a
   -> m (MNode (PrimState m) a)
-mPushTail size shift root tailArr = go shift root
+mPushTail size shift root tailArr = case root of
+  Frozen (Leaf _) -> do
+    -- Root is a single leaf; wrap it into an Internal node with the new tail
+    arr <- newSmallArray 2 (Frozen Empty)
+    writeSmallArray arr 0 root
+    writeSmallArray arr 1 (Frozen (Leaf tailArr))
+    pure (MInternal arr)
+  _ -> go shift root
   where
     go level node = do
       arr <- editableInternal node
@@ -2124,13 +2131,11 @@ mPushTail size shift root tailArr = go shift root
           !subIdx = indexAtLevel (size - 1) level
       if level == bfBits
         then do
-          -- At the leaf level, place the tail
           if subIdx < n
             then do
               writeSmallArray arr subIdx (Frozen (Leaf tailArr))
               pure (MInternal arr)
             else do
-              -- Need to grow the array
               newArr <- newSmallArray (subIdx + 1) (Frozen Empty)
               copySmallMutableArray newArr 0 arr 0 n
               writeSmallArray newArr subIdx (Frozen (Leaf tailArr))
