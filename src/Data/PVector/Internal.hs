@@ -388,19 +388,44 @@ foldlChunk f !z0 arr
   where !n = sizeofSmallArray arr
 {-# INLINE foldlChunk #-}
 
+-- | Strict left fold over a full 32-element SmallArray.
+-- Fully unrolled: no loop counter, no branch per element.
+-- GHC compiles this to straight-line code.
 foldlChunk32 :: (b -> a -> b) -> b -> SmallArray a -> b
-foldlChunk32 f !z0 arr = go z0 0
-  where
-    go !z !i
-      | i >= 32   = z
-      | i + 3 < 32 =
-          let !z1 = f z  (indexSmallArray arr i)
-              !z2 = f z1 (indexSmallArray arr (i+1))
-              !z3 = f z2 (indexSmallArray arr (i+2))
-              !z4 = f z3 (indexSmallArray arr (i+3))
-          in go z4 (i + 4)
-      | otherwise =
-          go (f z (indexSmallArray arr i)) (i + 1)
+foldlChunk32 f !z0 arr =
+  let !z1  = f z0  (indexSmallArray arr 0)
+      !z2  = f z1  (indexSmallArray arr 1)
+      !z3  = f z2  (indexSmallArray arr 2)
+      !z4  = f z3  (indexSmallArray arr 3)
+      !z5  = f z4  (indexSmallArray arr 4)
+      !z6  = f z5  (indexSmallArray arr 5)
+      !z7  = f z6  (indexSmallArray arr 6)
+      !z8  = f z7  (indexSmallArray arr 7)
+      !z9  = f z8  (indexSmallArray arr 8)
+      !z10 = f z9  (indexSmallArray arr 9)
+      !z11 = f z10 (indexSmallArray arr 10)
+      !z12 = f z11 (indexSmallArray arr 11)
+      !z13 = f z12 (indexSmallArray arr 12)
+      !z14 = f z13 (indexSmallArray arr 13)
+      !z15 = f z14 (indexSmallArray arr 14)
+      !z16 = f z15 (indexSmallArray arr 15)
+      !z17 = f z16 (indexSmallArray arr 16)
+      !z18 = f z17 (indexSmallArray arr 17)
+      !z19 = f z18 (indexSmallArray arr 18)
+      !z20 = f z19 (indexSmallArray arr 19)
+      !z21 = f z20 (indexSmallArray arr 20)
+      !z22 = f z21 (indexSmallArray arr 21)
+      !z23 = f z22 (indexSmallArray arr 22)
+      !z24 = f z23 (indexSmallArray arr 23)
+      !z25 = f z24 (indexSmallArray arr 24)
+      !z26 = f z25 (indexSmallArray arr 25)
+      !z27 = f z26 (indexSmallArray arr 26)
+      !z28 = f z27 (indexSmallArray arr 27)
+      !z29 = f z28 (indexSmallArray arr 28)
+      !z30 = f z29 (indexSmallArray arr 29)
+      !z31 = f z30 (indexSmallArray arr 30)
+      !z32 = f z31 (indexSmallArray arr 31)
+  in z32
 {-# INLINE foldlChunk32 #-}
 
 foldlChunkN :: (b -> a -> b) -> b -> SmallArray a -> Int -> b
@@ -424,6 +449,16 @@ foldrChunk32 f arr z0 = go 0
   where
     go !i
       | i >= 32   = z0
+      | i + 7 < 32 =
+          f (indexSmallArray arr i)
+          (f (indexSmallArray arr (i+1))
+          (f (indexSmallArray arr (i+2))
+          (f (indexSmallArray arr (i+3))
+          (f (indexSmallArray arr (i+4))
+          (f (indexSmallArray arr (i+5))
+          (f (indexSmallArray arr (i+6))
+          (f (indexSmallArray arr (i+7))
+          (go (i + 8)))))))))
       | otherwise = f (indexSmallArray arr i) (go (i + 1))
 {-# INLINE foldrChunk32 #-}
 
@@ -443,21 +478,43 @@ mapChunk f arr
   where !n = sizeofSmallArray arr
 {-# INLINE mapChunk #-}
 
+-- | Strict map over a full 32-element SmallArray.
+-- Fully unrolled: straight-line writes, no loop counter.
 mapChunk32 :: (a -> b) -> SmallArray a -> SmallArray b
 mapChunk32 f arr = runST $ do
   marr <- newSmallArray 32 undefinedElem
-  let go !i
-        | i >= 32 = pure ()
-        | i + 3 < 32 = do
-            writeSmallArray marr i     $! f (indexSmallArray arr i)
-            writeSmallArray marr (i+1) $! f (indexSmallArray arr (i+1))
-            writeSmallArray marr (i+2) $! f (indexSmallArray arr (i+2))
-            writeSmallArray marr (i+3) $! f (indexSmallArray arr (i+3))
-            go (i + 4)
-        | otherwise = do
-            writeSmallArray marr i $! f (indexSmallArray arr i)
-            go (i + 1)
-  go 0
+  writeSmallArray marr 0  $! f (indexSmallArray arr 0)
+  writeSmallArray marr 1  $! f (indexSmallArray arr 1)
+  writeSmallArray marr 2  $! f (indexSmallArray arr 2)
+  writeSmallArray marr 3  $! f (indexSmallArray arr 3)
+  writeSmallArray marr 4  $! f (indexSmallArray arr 4)
+  writeSmallArray marr 5  $! f (indexSmallArray arr 5)
+  writeSmallArray marr 6  $! f (indexSmallArray arr 6)
+  writeSmallArray marr 7  $! f (indexSmallArray arr 7)
+  writeSmallArray marr 8  $! f (indexSmallArray arr 8)
+  writeSmallArray marr 9  $! f (indexSmallArray arr 9)
+  writeSmallArray marr 10 $! f (indexSmallArray arr 10)
+  writeSmallArray marr 11 $! f (indexSmallArray arr 11)
+  writeSmallArray marr 12 $! f (indexSmallArray arr 12)
+  writeSmallArray marr 13 $! f (indexSmallArray arr 13)
+  writeSmallArray marr 14 $! f (indexSmallArray arr 14)
+  writeSmallArray marr 15 $! f (indexSmallArray arr 15)
+  writeSmallArray marr 16 $! f (indexSmallArray arr 16)
+  writeSmallArray marr 17 $! f (indexSmallArray arr 17)
+  writeSmallArray marr 18 $! f (indexSmallArray arr 18)
+  writeSmallArray marr 19 $! f (indexSmallArray arr 19)
+  writeSmallArray marr 20 $! f (indexSmallArray arr 20)
+  writeSmallArray marr 21 $! f (indexSmallArray arr 21)
+  writeSmallArray marr 22 $! f (indexSmallArray arr 22)
+  writeSmallArray marr 23 $! f (indexSmallArray arr 23)
+  writeSmallArray marr 24 $! f (indexSmallArray arr 24)
+  writeSmallArray marr 25 $! f (indexSmallArray arr 25)
+  writeSmallArray marr 26 $! f (indexSmallArray arr 26)
+  writeSmallArray marr 27 $! f (indexSmallArray arr 27)
+  writeSmallArray marr 28 $! f (indexSmallArray arr 28)
+  writeSmallArray marr 29 $! f (indexSmallArray arr 29)
+  writeSmallArray marr 30 $! f (indexSmallArray arr 30)
+  writeSmallArray marr 31 $! f (indexSmallArray arr 31)
   unsafeFreezeSmallArray marr
 {-# INLINE mapChunk32 #-}
 

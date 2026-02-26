@@ -1098,7 +1098,7 @@ filterDirect p v
           st <- getMV mv
           if mvTailSize st == 0 && sizeofSmallArray arr == bf
             then mPushChunk mv arr
-            else filterArr arr 0 (sizeofSmallArray arr) mv
+            else pushAll arr 0 (sizeofSmallArray arr) mv
       | otherwise = filterArr arr 0 (sizeofSmallArray arr) mv
 
     allPass :: SmallArray a -> Bool
@@ -1108,6 +1108,12 @@ filterDirect p v
         go !i | i >= n    = True
               | p (indexSmallArray arr i) = go (i + 1)
               | otherwise = False
+
+    -- Push all elements unconditionally (we already know they all pass)
+    pushAll :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
+    pushAll !arr !i !limit !mv
+      | i >= limit = pure ()
+      | otherwise = mPush mv (indexSmallArray arr i) >> pushAll arr (i + 1) limit mv
 
     filterArr :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
     filterArr !arr !i !limit !mv
