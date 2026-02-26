@@ -3,8 +3,9 @@
 
 -- | Persistent vector with efficient prepend (cons) and random access.
 --
--- Internally this is a 'Data.PVector.Back.Vector' with reversed
--- element ordering: @cons@ maps to @snoc@ on the underlying vector,
+-- Now that the base 'Data.PVector.Back.Vector' supports O(eC) prepend
+-- via its prefix buffer, 'FrontVector' is a thin wrapper that reverses
+-- the element ordering. @cons@ maps to @snoc@ on the underlying vector,
 -- and index @i@ maps to @n − 1 − i@ internally.
 module Data.PVector.Front
   ( FrontVector
@@ -132,8 +133,6 @@ singleton :: a -> FrontVector a
 singleton x = FrontVector (B.singleton x)
 {-# INLINE singleton #-}
 
--- | Build from a list. The first list element becomes the head.
--- Internally reverses into the underlying back vector.
 fromList :: [a] -> FrontVector a
 fromList xs = FrontVector $ B.create $ \mv ->
   let collect []     acc = pushAll mv acc
@@ -155,7 +154,6 @@ cons x (FrontVector v) = FrontVector (B.snoc v x)
 (<|) = cons
 {-# INLINE (<|) #-}
 
--- | Append to the back. O(n) since the underlying vector must be rebuilt.
 snoc :: FrontVector a -> a -> FrontVector a
 snoc (FrontVector v) x = FrontVector $ B.create $ \mv -> do
   B.mPush mv x

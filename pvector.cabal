@@ -1,19 +1,26 @@
 cabal-version:       3.0
 name:                pvector
 version:             0.2.0.0
-synopsis:            Persistent vectors with transients, inspired by Clojure
+synopsis:            RRB-tree persistent vectors with O(log n) concat/split
 description:
   Efficient persistent (immutable) vector implementations based on
-  bit-partitioned array mapped tries with 32-way branching.
+  Relaxed Radix Balanced trees (RRB-trees) with 32-way branching.
+  .
+  Key improvements over traditional Clojure-style persistent vectors:
+  .
+  * O(eC) prepend AND append via symmetric prefix\/suffix buffers
+  * O(log n) concatenation via RRB merge
+  * O(log n) take\/drop\/splitAt via RRB split
+  * O(1) head\/last via direct buffer access
   .
   Provides three vector variants:
   .
-  * @Data.PVector.Back@ — snoc-efficient (append to back)
-  * @Data.PVector.Front@ — cons-efficient (prepend to front)
-  * @Data.PVector.Deque@ — efficient at both ends
+  * @Data.PVector.Back@ — the main RRB vector with efficient operations at both ends
+  * @Data.PVector.Front@ — cons-efficient (reversed internal ordering)
+  * @Data.PVector.Deque@ — double-ended deque backed by two vectors
   .
-  Each variant supports transient (mutable) counterparts for
-  batch operations. Includes stream fusion via GHC rewrite rules.
+  Supports transient (mutable) counterparts for batch operations
+  and stream fusion via GHC rewrite rules.
 homepage:            https://github.com/iand675/pvector
 license:             MIT
 license-file:        LICENSE
@@ -29,6 +36,7 @@ library
                      , Data.PVector.Deque
   other-modules:       Data.PVector.Internal
                      , Data.PVector.Internal.Stream
+                     , Data.PVector.Internal.ChunkedBundle
   build-depends:       base >= 4.16 && < 5
                      , deepseq >= 1.4
                      , primitive >= 0.7.3

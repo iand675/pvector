@@ -1,42 +1,47 @@
 # pvector
 
-Efficient persistent (immutable) vector library for Haskell, inspired by
-Clojure's persistent vectors.
+RRB-tree persistent (immutable) vector library for Haskell. Based on Relaxed
+Radix Balanced trees (Stucki et al.), extending the Clojure/Scala model with
+O(log n) concatenation and splitting.
 
 ## Data Structures
 
 ### `Data.PVector.Back` (default, re-exported from `Data.PVector`)
 
-A persistent vector based on a 32-way branching trie with a tail buffer.
+An RRB-tree persistent vector with symmetric prefix/suffix buffers.
 
-- **snoc** (append): O(1) amortized — **10–100x faster than Data.Vector for incremental building**
-- **unsnoc** (remove last): O(1) amortized
-- **index**: O(log₃₂ n) — typically 1–2 pointer chases, within 1.5x of Data.Vector
+Elements are stored in three regions:
+1. **prefix** — leftmost partial leaf (prepend buffer, 0–31 elements)
+2. **tree** — RRB-tree with balanced and relaxed nodes
+3. **suffix/tail** — rightmost partial leaf (append buffer, 0–31 elements)
+
+Relaxed nodes carry cumulative size tables (`PrimArray Int`) so indexing
+can use binary search at relaxed levels, then fall through to radix
+arithmetic at balanced levels below.
+
+#### Complexity
+
+- **cons** (prepend): O(eC) amortized — fills prefix buffer; flushes to tree every 32 elements
+- **snoc** (append): O(eC) amortized — fills suffix buffer; flushes to tree every 32 elements
+- **uncons** / **unsnoc**: O(eC) amortized
+- **head**: O(1) — direct access to prefix buffer
+- **last**: O(1) — direct access to suffix buffer
+- **index**: O(log₃₂ n) — radix arithmetic at balanced nodes, binary search at relaxed nodes
 - **update**: O(log₃₂ n) — persistent (old version unchanged)
-- **head**: O(log₃₂ n)
-- **last**: O(1) — reads directly from tail buffer
+- **concat / (++)**: O(log n) — RRB merge of right spine and left spine
+- **take / drop / splitAt**: O(log n) — RRB split, creates relaxed nodes at boundaries
 - **fromList**: O(n) — builds through transient
-- **foldl'/foldr**: O(n) with direct tree-walking (no per-chunk re-traversal)
-- **map**: O(n) — preserves trie structure directly, ~2x of Data.Vector
+- **foldl' / foldr**: O(n) with direct tree walking
+- **map**: O(n) — preserves trie structure
 
 ### `Data.PVector.Front`
 
-A persistent vector optimized for prepend operations. Internally wraps a
-`Back` vector with reversed index mapping.
-
-- **cons** (prepend): O(1) amortized
-- **uncons** (remove first): O(1) amortized
-- **head**: O(1)
-- **index**: O(log₃₂ n)
+A persistent vector with reversed internal ordering. `cons` maps to
+`snoc` on the underlying vector.
 
 ### `Data.PVector.Deque`
 
 A double-ended persistent vector (banker's deque) using two back vectors.
-
-- **cons** and **snoc**: O(1) amortized
-- **uncons** and **unsnoc**: O(1) amortized
-- **head** and **last**: O(1)
-- **index**: O(log₃₂ n)
 
 ## Features
 
@@ -64,9 +69,9 @@ A double-ended persistent vector (banker's deque) using two back vectors.
 ### Why not `Data.Vector.Generic`?
 
 `Data.Vector.Generic.Vector` requires O(1) `basicUnsafeSlice` on both
-immutable and mutable vectors. A persistent trie fundamentally cannot
-provide O(1) slicing — a slice requires rebuilding the trie structure.
-We match the API surface instead so code can migrate with minimal changes.
+immutable and mutable vectors. RRB-trees provide O(log n) slicing —
+much better than O(n) but still not O(1). We match the API surface
+instead so code can migrate with minimal changes.
 
 ## Benchmarks (n = 10,000)
 
@@ -141,26 +146,33 @@ import qualified Data.PVector as V
 
 -- Construction
 let v = V.fromList [1..1000]
-let v2 = V.snoc v 1001
+let v2 = V.snoc v 1001       -- O(eC) append
+let v3 = V.cons 0 v          -- O(eC) prepend (new!)
 
--- Indexing
+-- O(1) access to both ends
+V.head v  -- 1
+V.last v  -- 1000
+
+-- O(log₃₂ n) indexing
 V.index v 500  -- 501
-V.last v       -- 1000
+
+-- O(log n) concatenation (new! was O(n))
+let big = V.fromList [1..10000] <> V.fromList [10001..20000]
+
+-- O(log n) slicing (new! was O(n))
+let middle = V.take 500 (V.drop 250 v)  -- elements 251-750
 
 -- Persistent update (old version preserved)
-let v3 = V.update 500 42 v
+let v4 = V.update 500 42 v
 V.index v  500  -- 501 (unchanged)
-V.index v3 500  -- 42
+V.index v4 500  -- 42
 
 -- Transformations
 V.map (*2) v
 V.filter even v
 
--- Chunk-based operations
-V.foldChunks (\acc _ chunk -> acc + sizeofSmallArray chunk) 0 v
-
 -- Transient (batch mutation)
-let v4 = V.create $ \mv -> do
+let v5 = V.create $ \mv -> do
       mapM_ (V.mPush mv) [1..100]
       V.mWrite mv 50 999
 ```

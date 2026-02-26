@@ -314,6 +314,123 @@ backVectorTests = testGroup "Data.PVector.Back"
         let v1 = V.fromList xs
             v2 = V.fromList ys
         V.toList (V.zipWith (+) v1 v2) Hedgehog.=== Prelude.zipWith (+) xs ys
+    -- RRB-specific tests
+    , testProperty "cons builds in order" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
+        let v = Prelude.foldr V.cons V.empty xs
+        V.toList v Hedgehog.=== xs
+    , testProperty "cons then uncons" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
+        x <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v = V.fromList xs
+            v' = V.cons x v
+        case V.uncons v' of
+          Nothing -> Hedgehog.failure
+          Just (y, v'') -> do
+            y Hedgehog.=== x
+            V.toList v'' Hedgehog.=== xs
+    , testProperty "cons/snoc interleaved" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 100) (Gen.int (Range.linear 0 10000))
+        let v0 = V.fromList [100..200 :: Int]
+            vConsed = Prelude.foldr V.cons v0 xs
+        V.toList vConsed Hedgehog.=== (xs Prelude.++ [100..200])
+    , testProperty "head after cons" $ Hedgehog.property $ do
+        x <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        let v = V.cons x (V.fromList xs)
+        V.head v Hedgehog.=== x
+    , testProperty "last after snoc" $ Hedgehog.property $ do
+        x <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        let v = V.snoc (V.fromList xs) x
+        V.last v Hedgehog.=== x
+    , testProperty "append large vectors" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 1000) (Gen.int (Range.linear 0 10000))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 1000) (Gen.int (Range.linear 0 10000))
+        let v1 = V.fromList xs
+            v2 = V.fromList ys
+        V.toList (v1 <> v2) Hedgehog.=== (xs Prelude.++ ys)
+    , testProperty "take preserves prefix" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 (Prelude.length xs))
+        let v = V.fromList xs
+        V.toList (V.take n v) Hedgehog.=== Prelude.take n xs
+    , testProperty "drop preserves suffix" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 (Prelude.length xs))
+        let v = V.fromList xs
+        V.toList (V.drop n v) Hedgehog.=== Prelude.drop n xs
+    , testProperty "splitAt matches take/drop" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 10000))
+        n <- Hedgehog.forAll $ Gen.int (Range.linear 0 (Prelude.length xs))
+        let v = V.fromList xs
+            (l, r) = V.splitAt n v
+        V.toList l Hedgehog.=== Prelude.take n xs
+        V.toList r Hedgehog.=== Prelude.drop n xs
+    , testProperty "index after cons" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 200) (Gen.int (Range.linear 0 10000))
+        let v = Prelude.foldr V.cons V.empty xs
+        i <- Hedgehog.forAll $ Gen.int (Range.linear 0 (Prelude.length xs - 1))
+        V.index v i Hedgehog.=== xs !! i
+    , testProperty "update after cons" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 200) (Gen.int (Range.linear 0 10000))
+        let v = Prelude.foldr V.cons V.empty xs
+            n = Prelude.length xs
+        i <- Hedgehog.forAll $ Gen.int (Range.linear 0 (n - 1))
+        val <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v' = V.update i val v
+        V.index v' i Hedgehog.=== val
+    , testProperty "append then index" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        let v = V.fromList xs <> V.fromList ys
+            combined = xs Prelude.++ ys
+            n = Prelude.length combined
+        when (n > 0) $ do
+          i <- Hedgehog.forAll $ Gen.int (Range.linear 0 (n - 1))
+          V.index v i Hedgehog.=== combined !! i
+    , testProperty "take/drop on concatenated" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 200) (Gen.int (Range.linear 0 10000))
+        let v = V.fromList xs <> V.fromList ys
+            combined = xs Prelude.++ ys
+            n = Prelude.length combined
+        k <- Hedgehog.forAll $ Gen.int (Range.linear 0 n)
+        V.toList (V.take k v) Hedgehog.=== Prelude.take k combined
+        V.toList (V.drop k v) Hedgehog.=== Prelude.drop k combined
+    , testProperty "multiple appends" $ Hedgehog.property $ do
+        xss <- Hedgehog.forAll $ Gen.list (Range.linear 0 10)
+                 (Gen.list (Range.linear 0 100) (Gen.int (Range.linear 0 10000)))
+        let v = V.concat (Prelude.map V.fromList xss)
+        V.toList v Hedgehog.=== Prelude.concat xss
+    , testProperty "batch update (//) matches sequential update" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 200) (Gen.int (Range.linear 0 10000))
+        let n = Prelude.length xs
+            v = V.fromList xs
+        numUpdates <- Hedgehog.forAll $ Gen.int (Range.linear 0 (min 20 n))
+        indices <- Hedgehog.forAll $ Gen.list (Range.constant numUpdates numUpdates) (Gen.int (Range.linear 0 (n - 1)))
+        vals <- Hedgehog.forAll $ Gen.list (Range.constant numUpdates numUpdates) (Gen.int (Range.linear 0 10000))
+        let updates = Prelude.zip indices vals
+            vBatch = v V.// updates
+            vSeq = Prelude.foldl (\acc (i, x) -> V.update i x acc) v updates
+        V.toList vBatch Hedgehog.=== V.toList vSeq
+    , testProperty "batch update (//) with duplicates keeps last" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 100) (Gen.int (Range.linear 0 10000))
+        let n = Prelude.length xs
+            v = V.fromList xs
+        i <- Hedgehog.forAll $ Gen.int (Range.linear 0 (n - 1))
+        val1 <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        val2 <- Hedgehog.forAll $ Gen.int (Range.linear 0 10000)
+        let v' = v V.// [(i, val1), (i, val2)]
+        V.index v' i Hedgehog.=== val2
+    , testProperty "foldl' . map == foldl' (f . g)" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 100))
+        let v = V.fromList xs
+        V.foldl' (+) 0 (V.map (*2) v) Hedgehog.=== L.foldl' (\a x -> a + x*2) 0 xs
+    , testProperty "foldl' . filter == filtered foldl'" $ Hedgehog.property $ do
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 500) (Gen.int (Range.linear 0 100))
+        let v = V.fromList xs
+        V.foldl' (+) 0 (V.filter even v) Hedgehog.=== L.foldl' (\a x -> if even x then a + x else a) 0 xs
     ]
   ]
 
