@@ -63,7 +63,7 @@ import qualified Data.PVector.Back as B
 
 import Prelude hiding
   ( null, length, head, last, map, filter, reverse
-  , foldMap, tail, init, foldr, foldl'
+  , foldMap, tail, init, foldr
   )
 import qualified Data.Foldable as F
 

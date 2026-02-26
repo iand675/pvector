@@ -75,7 +75,7 @@ import Control.Monad.ST
 import Data.Bits
 import Data.Primitive.SmallArray
 import qualified Data.Primitive.PrimArray as PA
-import Unsafe.Coerce (unsafeCoerce)
+-- import Unsafe.Coerce (unsafeCoerce)
 
 type PrimArray = PA.PrimArray
 

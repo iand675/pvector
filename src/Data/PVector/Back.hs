@@ -168,7 +168,6 @@ module Data.PVector.Back
   , mPop
 
     -- * Fast bulk construction
-  , fromListN
   , generateN
   , unsafeFromChunks
 
@@ -190,7 +189,6 @@ module Data.PVector.Back
   , rfoldl'
   , rfoldr
   , forEach_
-  , vSize, vShift, vRoot, vTail, vPrefix
   ) where
 
 import Control.Applicative (Alternative)
@@ -208,13 +206,13 @@ import GHC.Base (build)
 
 import Data.PVector.Internal
 import Data.PVector.Internal.Stream
-  (Bundle(..), Step(..), Size(..), MStream(..), Id(..), Stream)
+  (Bundle(..), Step(..), Size(..), MStream(..), Id(..))
 import qualified Data.PVector.Internal.Stream as S
 
 import Prelude hiding
   ( null, length, head, last, map, reverse, filter, take, drop
   , foldMap, zip, zip3, zipWith, unzip
-  , replicate, unfoldr, foldr, foldl', foldl, foldl1, foldr1
+  , replicate, foldr, foldl, foldl1, foldr1
   , concat, concatMap, (++), init, tail, splitAt
   , mapM, mapM_, sequence, elem, notElem, all, any, and, or
   , sum, product, maximum, minimum
@@ -267,22 +265,6 @@ getMV (MVector ref) = readMutVar ref
 putMV :: PrimMonad m => MVector (PrimState m) a -> MVState (PrimState m) a -> m ()
 putMV (MVector ref) = writeMutVar ref
 {-# INLINE putMV #-}
-
-------------------------------------------------------------------------
--- Internal sizing helpers
-------------------------------------------------------------------------
-
-prefixLen :: Vector a -> Int
-prefixLen v = sizeofSmallArray (vPrefix v)
-{-# INLINE prefixLen #-}
-
-tailLen :: Vector a -> Int
-tailLen v = sizeofSmallArray (vTail v)
-{-# INLINE tailLen #-}
-
-treeLen :: Vector a -> Int
-treeLen v = vSize v - prefixLen v - tailLen v
-{-# INLINE treeLen #-}
 
 ------------------------------------------------------------------------
 -- Instances
