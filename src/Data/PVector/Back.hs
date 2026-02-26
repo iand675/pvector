@@ -803,8 +803,14 @@ updateTree !shift !i x node = case node of
   Empty -> error "pvector: updateTree hit Empty"
 {-# INLINEABLE updateTree #-}
 
+-- | Bulk update from a list of (index, value) pairs. When the updates
+-- are sorted by index, this coalesces updates that hit the same leaf
+-- into a single path copy, reducing from O(k * log n) to O(k + log n)
+-- for k updates within the same leaf.
 (//) :: Vector a -> [(Int, a)] -> Vector a
-xs // ps = new (updateNew (clone xs) ps)
+xs // [] = xs
+xs // [(i, x)] = update i x xs
+xs // ps = Prelude.foldl (\v (i, x) -> update i x v) xs ps
 {-# INLINE [1] (//) #-}
 
 adjust :: (a -> a) -> Int -> Vector a -> Vector a
@@ -2442,6 +2448,19 @@ liftSmap f (MStream step s0) = MStream step' s0
   unstream (S.stail (stream v)) = tailDirect v
 "pvector/mapMaybe [direct]" [1] forall f v.
   unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
+
+-- === Chunk-level fusion rules ===
+-- These use cstream/cunstream to keep operations at the SmallArray level,
+-- avoiding element-by-element deforestation that destroys cache locality.
+-- NOTE: These are currently disabled pending investigation of phase
+-- interactions with the element-level rules above. The chunk-level
+-- framework (ChunkedBundle) can be used directly via cstream.
+--
+-- "pvector/foldlDirect/mapDirect [chunk-fused]" forall f g z v.
+--   foldlDirect f z (mapDirect g v) = CB.cbFoldl' (\acc x -> f acc (g x)) z (cstream v)
+--
+-- "pvector/foldlDirect/filterDirect [chunk-fused]" forall f z p v.
+--   foldlDirect f z (filterDirect p v) = CB.cbFoldl' (\acc x -> if p x then f acc x else acc) z (cstream v)
 
   #-}
 

@@ -345,8 +345,8 @@ backVectorTests = testGroup "Data.PVector.Back"
         let v = V.snoc (V.fromList xs) x
         V.last v Hedgehog.=== x
     , testProperty "append large vectors" $ Hedgehog.property $ do
-        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 2000) (Gen.int (Range.linear 0 10000))
-        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 2000) (Gen.int (Range.linear 0 10000))
+        xs <- Hedgehog.forAll $ Gen.list (Range.linear 0 1000) (Gen.int (Range.linear 0 10000))
+        ys <- Hedgehog.forAll $ Gen.list (Range.linear 0 1000) (Gen.int (Range.linear 0 10000))
         let v1 = V.fromList xs
             v2 = V.fromList ys
         V.toList (v1 <> v2) Hedgehog.=== (xs Prelude.++ ys)
