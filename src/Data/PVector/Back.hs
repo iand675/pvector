@@ -208,6 +208,9 @@ import Data.PVector.Internal
 import Data.PVector.Internal.Stream
   (Bundle(..), Step(..), Size(..), MStream(..), Id(..))
 import qualified Data.PVector.Internal.Stream as S
+import Data.PVector.Internal.ChunkedBundle (ChunkedBundle, Chunk(..), CStep(..), CSize(..))
+import qualified Data.PVector.Internal.ChunkedBundle as CB
+import GHC.Exts (reallyUnsafePtrEquality#, isTrue#)
 
 import Prelude hiding
   ( null, length, head, last, map, reverse, filter, take, drop
@@ -276,11 +279,7 @@ instance Show a => Show (Vector a) where
 instance Eq a => Eq (Vector a) where
   v1 == v2
     | length v1 /= length v2 = False
-    | otherwise = go 0
-    where
-      !n = length v1
-      go i | i >= n = True
-           | otherwise = unsafeIndex v1 i == unsafeIndex v2 i && go (i + 1)
+    | otherwise = CB.cbEq (cstream v1) (cstream v2)
 
 instance Ord a => Ord (Vector a) where
   compare v1 v2 = go 0
@@ -2191,6 +2190,58 @@ data SState
 unstream :: Bundle a -> Vector a
 unstream = new . fill
 {-# INLINE [0] unstream #-}
+
+------------------------------------------------------------------------
+-- Chunk-level streaming (ChunkedBundle integration)
+------------------------------------------------------------------------
+
+-- | Convert a Vector to a ChunkedBundle, yielding prefix, tree leaves,
+-- and tail as contiguous chunks. Preserves chunk boundaries for
+-- cache-friendly iteration and pointer-equality-based comparison.
+cstream :: Vector a -> ChunkedBundle a
+cstream v = CB.cbFromChunks (collectChunks v)
+{-# INLINE [0] cstream #-}
+
+-- | Collect all chunks from a Vector in order: prefix, tree leaves, tail.
+collectChunks :: Vector a -> [Chunk a]
+collectChunks v = prefix (treeChunks (vShift v) (vRoot v) (suffix []))
+  where
+    !pArr = vPrefix v
+    !tArr = vTail v
+    prefix rest
+      | sizeofSmallArray pArr > 0 = Chunk pArr 0 (sizeofSmallArray pArr) : rest
+      | otherwise = rest
+    suffix rest
+      | sizeofSmallArray tArr > 0 = Chunk tArr 0 (sizeofSmallArray tArr) : rest
+      | otherwise = rest
+
+    treeChunks :: Int -> Node a -> [Chunk a] -> [Chunk a]
+    treeChunks _ Empty rest = rest
+    treeChunks _ (Leaf arr) rest = Chunk arr 0 (sizeofSmallArray arr) : rest
+    treeChunks sh (Internal arr) rest = childChunks sh arr 0 rest
+    treeChunks sh (Relaxed arr _) rest = childChunks sh arr 0 rest
+
+    childChunks :: Int -> SmallArray (Node a) -> Int -> [Chunk a] -> [Chunk a]
+    childChunks sh arr i rest
+      | i >= sizeofSmallArray arr = rest
+      | otherwise = treeChunks (sh - bfBits) (indexSmallArray arr i)
+                                (childChunks sh arr (i + 1) rest)
+
+-- | Rebuild a Vector from a ChunkedBundle by pushing chunk elements.
+cunstream :: ChunkedBundle a -> Vector a
+cunstream cb = create $ \mv ->
+  let chunks = CB.cbToChunkList cb
+      go [] = pure ()
+      go (Chunk arr off len : rest) = do
+        let pushElems !i
+              | i >= len  = pure ()
+              | otherwise = mPush mv (indexSmallArray arr (off + i)) >> pushElems (i + 1)
+        pushElems 0
+        go rest
+  in go chunks
+{-# INLINE [0] cunstream #-}
+
+{-# RULES "cstream/cunstream" forall b. cstream (cunstream b) = b #-}
 
 ------------------------------------------------------------------------
 -- Recycling framework (Leshchinskiy, "Recycle Your Arrays!", 2008)

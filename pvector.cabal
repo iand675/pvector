@@ -36,6 +36,7 @@ library
                      , Data.PVector.Deque
   other-modules:       Data.PVector.Internal
                      , Data.PVector.Internal.Stream
+                     , Data.PVector.Internal.ChunkedBundle
   build-depends:       base >= 4.16 && < 5
                      , deepseq >= 1.4
                      , primitive >= 0.7.3
