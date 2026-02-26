@@ -1073,8 +1073,49 @@ filter p = filterDirect p
 filterDirect :: forall a. (a -> Bool) -> Vector a -> Vector a
 filterDirect p v
   | vSize v == 0 = empty
-  | otherwise = create $ \mv ->
-      forEach_ v $ \a -> when (p a) (mPush mv a)
+  | otherwise = create $ \mv -> do
+      filterArr (vPrefix v) 0 (sizeofSmallArray (vPrefix v)) mv
+      filterNode (vShift v) (vRoot v) mv
+      filterArr (vTail v) 0 (sizeofSmallArray (vTail v)) mv
+  where
+    filterNode :: Int -> Node a -> MVector s a -> ST s ()
+    filterNode !_ Empty !_ = pure ()
+    filterNode !_ (Leaf arr) !mv = filterFullChunk arr mv
+    filterNode !shift (Internal arr) !mv = do
+      let !nc = sizeofSmallArray arr
+          go !i | i >= nc   = pure ()
+                | otherwise = filterNode (shift - bfBits) (indexSmallArray arr i) mv >> go (i + 1)
+      go 0
+    filterNode !shift (Relaxed arr _) !mv = do
+      let !nc = sizeofSmallArray arr
+          go !i | i >= nc   = pure ()
+                | otherwise = filterNode (shift - bfBits) (indexSmallArray arr i) mv >> go (i + 1)
+      go 0
+
+    filterFullChunk :: SmallArray a -> MVector s a -> ST s ()
+    filterFullChunk !arr !mv
+      | allPass arr = do
+          st <- getMV mv
+          if mvTailSize st == 0 && sizeofSmallArray arr == bf
+            then mPushChunk mv arr
+            else filterArr arr 0 (sizeofSmallArray arr) mv
+      | otherwise = filterArr arr 0 (sizeofSmallArray arr) mv
+
+    allPass :: SmallArray a -> Bool
+    allPass !arr = go 0
+      where
+        !n = sizeofSmallArray arr
+        go !i | i >= n    = True
+              | p (indexSmallArray arr i) = go (i + 1)
+              | otherwise = False
+
+    filterArr :: SmallArray a -> Int -> Int -> MVector s a -> ST s ()
+    filterArr !arr !i !limit !mv
+      | i >= limit = pure ()
+      | otherwise = do
+          let !a = indexSmallArray arr i
+          when (p a) (mPush mv a)
+          filterArr arr (i + 1) limit mv
 {-# INLINE filterDirect #-}
 
 ifilter :: (Int -> a -> Bool) -> Vector a -> Vector a
@@ -1166,35 +1207,66 @@ foldl f z0 v = foldrDirect (\x k z -> k (f z x)) id v z0
 {-# INLINE foldl #-}
 
 foldl' :: (b -> a -> b) -> b -> Vector a -> b
-foldl' = foldlDirect
-{-# INLINE foldl' #-}
+foldl' f !z v = foldlDirect f z v
+{-# NOINLINE [1] foldl' #-}
 
 foldlDirect :: (b -> a -> b) -> b -> Vector a -> b
-foldlDirect f = \ !z0 v ->
+foldlDirect f = foldlWithGoArr (\z arr i limit -> goArrF z arr i limit) 
+  where
+    goArrF !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  = goArrF (f z (indexSmallArray arr i)) arr (i + 1) limit
+{-# INLINE [1] foldlDirect #-}
+
+-- | Core fold engine: walks prefix → tree → tail, applying @arrFold@
+-- to each contiguous SmallArray segment. The @arrFold@ is the tight
+-- inner loop that GHC specializes per call site.
+foldlWithGoArr :: (b -> SmallArray a -> Int -> Int -> b) -> b -> Vector a -> b
+foldlWithGoArr arrFold = \ !z0 v ->
   if vSize v == 0
   then z0
   else
-    let !z1 = goArr z0 (vPrefix v) 0 (sizeofSmallArray (vPrefix v))
+    let !z1 = arrFold z0 (vPrefix v) 0 (sizeofSmallArray (vPrefix v))
         !z2 = goNode z1 (vShift v) (vRoot v)
-        !z3 = goArr z2 (vTail v) 0 (sizeofSmallArray (vTail v))
+        !z3 = arrFold z2 (vTail v) 0 (sizeofSmallArray (vTail v))
     in z3
   where
     goNode !z !_ Empty = z
-    goNode !z !_ (Leaf arr) = foldlChunk f z arr
+    goNode !z !_ (Leaf arr) = arrFold z arr 0 (sizeofSmallArray arr)
     goNode !z !shift (Internal arr) = goChildren z shift arr
     goNode !z !shift (Relaxed arr _) = goChildren z shift arr
 
     goChildren !z !shift arr =
-      let !n = sizeofSmallArray arr
+      let !nc = sizeofSmallArray arr
           go !z' !i
-            | i >= n    = z'
+            | i >= nc   = z'
             | otherwise = go (goNode z' (shift - bfBits) (indexSmallArray arr i)) (i + 1)
       in go z 0
+{-# INLINE foldlWithGoArr #-}
 
-    goArr !z !arr !i !limit
+-- | Fused fold+map: walks the tree chunk-by-chunk, applying @g@ then @f@
+-- in a single tight loop per leaf. O(n), not O(n log n).
+foldlMapDirect :: (b -> c -> b) -> (a -> c) -> b -> Vector a -> b
+foldlMapDirect f g = foldlWithGoArr goArrMapped
+  where
+    goArrMapped !z !arr !i !limit
       | i >= limit = z
-      | otherwise  = goArr (f z (indexSmallArray arr i)) arr (i + 1) limit
-{-# INLINE [1] foldlDirect #-}
+      | otherwise  = goArrMapped (f z (g (indexSmallArray arr i))) arr (i + 1) limit
+{-# INLINE foldlMapDirect #-}
+
+-- | Fused fold+filter: walks the tree chunk-by-chunk, testing @p@ then
+-- applying @f@ in a single tight loop per leaf. O(n), not O(n log n).
+foldlFilterDirect :: (b -> a -> b) -> (a -> Bool) -> b -> Vector a -> b
+foldlFilterDirect f p = foldlWithGoArr goArrFiltered
+  where
+    goArrFiltered !z !arr !i !limit
+      | i >= limit = z
+      | otherwise  =
+          let !x = indexSmallArray arr i
+          in if p x
+             then goArrFiltered (f z x) arr (i + 1) limit
+             else goArrFiltered z arr (i + 1) limit
+{-# INLINE foldlFilterDirect #-}
 
 foldl1 :: (a -> a -> a) -> Vector a -> a
 foldl1 f v
@@ -1447,12 +1519,54 @@ fromVector :: F.Foldable f => f a -> Vector a
 fromVector = F.foldl' snoc empty
 {-# INLINE fromVector #-}
 
+-- | O(n). Reverse by mirroring the tree structure: swap prefix↔tail,
+-- reverse child order at each internal node, reverse each leaf array.
+-- Each array element is visited exactly once (no O(log n) per-element indexing).
 reverse :: Vector a -> Vector a
 reverse v
   | n <= 1    = v
-  | otherwise = generate n (\i -> unsafeIndex v (n - 1 - i))
-  where !n = vSize v
+  | otherwise = Vector n (vShift v) (reverseArr (vTail v)) (reverseNode (vShift v) (vRoot v)) (reverseArr (vPrefix v))
+  where
+    !n = vSize v
 {-# INLINE reverse #-}
+
+reverseArr :: SmallArray a -> SmallArray a
+reverseArr arr
+  | len <= 1 = arr
+  | otherwise = runST $ do
+      marr <- newSmallArray len uninit
+      let go !i !j
+            | i >= len  = pure ()
+            | otherwise = writeSmallArray marr i (indexSmallArray arr j) >> go (i + 1) (j - 1)
+      go 0 (len - 1)
+      unsafeFreezeSmallArray marr
+  where
+    !len = sizeofSmallArray arr
+    uninit = error "pvector: reverseArr"
+{-# INLINE reverseArr #-}
+
+reverseNode :: Int -> Node a -> Node a
+reverseNode !_ Empty = Empty
+reverseNode !_ (Leaf arr) = Leaf (reverseArr arr)
+reverseNode !shift (Internal arr) = Internal (reverseChildren shift arr)
+reverseNode !shift (Relaxed arr sizes) =
+  let !newArr = reverseChildren shift arr
+      !nc = sizeofSmallArray arr
+      !newSizes = computeSizeTable shift newArr
+  in Relaxed newArr newSizes
+
+reverseChildren :: Int -> SmallArray (Node a) -> SmallArray (Node a)
+reverseChildren shift arr = runST $ do
+  let !nc = sizeofSmallArray arr
+  marr <- newSmallArray nc Empty
+  let go !i !j
+        | i >= nc   = pure ()
+        | otherwise = do
+            writeSmallArray marr i (reverseNode (shift - bfBits) (indexSmallArray arr j))
+            go (i + 1) (j - 1)
+  go 0 (nc - 1)
+  unsafeFreezeSmallArray marr
+{-# INLINE reverseChildren #-}
 
 ------------------------------------------------------------------------
 -- Chunk-based operations
@@ -2456,6 +2570,23 @@ liftSmap f (MStream step s0) = MStream step' s0
 
 {-# RULES
 
+-- === Pre-stream chunk-fused fold rules ===
+-- These fire at [~2] BEFORE the stream-forwarding rules at [~1].
+-- They intercept foldl'.map and foldl'.filter and route them to
+-- chunk-walking implementations that are O(n) instead of the
+-- O(n log n) element-level stream path (which calls treeIndex per element).
+
+"pvector/foldl'/map [chunk-fused]" [~2] forall f g z v.
+  foldl' f z (map g v) = foldlMapDirect f g z v
+
+"pvector/foldl'/filter [chunk-fused]" [~2] forall f z p v.
+  foldl' f z (filter p v) = foldlFilterDirect f p z v
+
+"pvector/foldl'/map/filter [chunk-fused]" [~2] forall f g z p v.
+  foldl' f z (map g (filter p v)) = foldlMapDirect f g z (filterDirect p v)
+
+-- === Core fusion and recycling rules ===
+
 "pvector/stream/unstream"
   forall s. stream (unstream s) = s
 
@@ -2552,19 +2683,7 @@ liftSmap f (MStream step s0) = MStream step' s0
 "pvector/mapMaybe [direct]" [1] forall f v.
   unstream (S.smapMaybe f (stream v)) = mapMaybeDirect f v
 
--- === Chunk-level fusion rules ===
--- These use cstream/cunstream to keep operations at the SmallArray level,
--- avoiding element-by-element deforestation that destroys cache locality.
--- They fire at phase [1] alongside the "direct" fallbacks, matching the
--- composed pattern before individual operations inline.
-
--- Chunk-level foldl' . map: tight inner loop over each chunk array
-"pvector/foldlDirect/mapDirect [chunk-fused]" [1] forall f g z v.
-  foldlDirect f z (mapDirect g v) = CB.cbFoldl' (\acc x -> f acc (g x)) z (cstream v)
-
--- Chunk-level foldl' . filter: fold with inline predicate, no alloc
-"pvector/foldlDirect/filterDirect [chunk-fused]" [1] forall f z p v.
-  foldlDirect f z (filterDirect p v) = CB.cbFoldl' (\acc x -> if p x then f acc x else acc) z (cstream v)
+-- (Chunk-level fused fold rules moved to pre-stream phase [~2] above)
 
   #-}
 
