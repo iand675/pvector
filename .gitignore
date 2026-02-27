@@ -9,3 +9,5 @@ dist-newstyle
 .cabal-sandbox
 cabal.sandbox.config
 cabal.project.local
+result
+result-*
