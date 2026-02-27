@@ -14,8 +14,7 @@
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          hspkgs = pkgs.haskell.packages.ghc96;
-          pvector = hspkgs.callCabal2nix "pvector" self {};
+          pvector = pkgs.haskellPackages.callCabal2nix "pvector" self {};
         in
         {
           inherit pvector;
@@ -26,7 +25,7 @@
       devShells = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          hspkgs = pkgs.haskell.packages.ghc96;
+          hspkgs = pkgs.haskellPackages;
           pvector = pkgs.haskell.lib.doBenchmark (hspkgs.callCabal2nix "pvector" self {});
         in
         {
