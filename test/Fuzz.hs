@@ -1076,7 +1076,8 @@ transientTests = testGroup "transient"
             mapM_ (V.mPush mv) xs
             popped <- drainMV mv []
             pure popped
-      result Hedgehog.=== reverse xs
+      -- drainMV pops from the right and prepends, restoring original order
+      result Hedgehog.=== xs
 
   , testProperty "mRead after mPush" $ Hedgehog.property $ do
       xs <- Hedgehog.forAll $ Gen.list (Range.linear 1 200) genVal
