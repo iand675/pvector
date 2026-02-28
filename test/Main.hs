@@ -13,11 +13,14 @@ import qualified Data.PVector.Front as F
 import qualified Data.PVector.Deque as D
 import qualified Data.List as L
 
+import Fuzz (fuzzTests)
+
 main :: IO ()
 main = defaultMain $ testGroup "pvector"
   [ backVectorTests
   , frontVectorTests
   , dequeTests
+  , fuzzTests
   ]
 
 ------------------------------------------------------------------------

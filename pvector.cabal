@@ -68,8 +68,10 @@ test-suite test-pvector
   type:             exitcode-stdio-1.0
   hs-source-dirs:   test
   main-is:          Main.hs
+  other-modules:    Fuzz
   build-depends:    base
                   , pvector
+                  , primitive
                   , tasty
                   , tasty-hunit
                   , hedgehog
